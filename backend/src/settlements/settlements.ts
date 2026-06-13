@@ -26,7 +26,7 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
         groupId,
         payerId,
         receiverId,
-        amount: new Decimal(parsedAmount),
+        amount: parsedAmount,
         currency: currency ? currency.toUpperCase().trim() : "INR",
         settlementDate: new Date(settlementDate)
       }

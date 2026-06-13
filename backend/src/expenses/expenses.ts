@@ -160,10 +160,10 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
           groupId,
           title: title.trim(),
           description: description?.trim() || null,
-          amount: new Decimal(parsedAmount),
+          amount: parsedAmount,
           currency: currencyUpper,
-          exchangeRate: new Decimal(exchangeRate),
-          normalizedAmount: new Decimal(normalizedAmount),
+          exchangeRate: exchangeRate,
+          normalizedAmount: normalizedAmount,
           paidBy,
           expenseDate: expDate,
           splitType
@@ -175,9 +175,9 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
           data: {
             expenseId: newExpense.id,
             userId: s.userId,
-            sharePercentage: s.sharePercentage !== null ? new Decimal(s.sharePercentage) : null,
-            shareAmount: new Decimal(s.shareAmount),
-            shareWeight: s.shareWeight !== null ? new Decimal(s.shareWeight) : null
+            sharePercentage: s.sharePercentage,
+            shareAmount: s.shareAmount,
+            shareWeight: s.shareWeight
           }
         });
       }

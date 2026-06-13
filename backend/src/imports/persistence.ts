@@ -15,6 +15,15 @@ export interface PersistenceResult {
   duplicatesDetected: number;
 }
 
+function jsonStringify(value: unknown): string {
+  return JSON.stringify(value, (_key, currentValue) => {
+    if (currentValue instanceof Date) {
+      return currentValue.toISOString();
+    }
+    return currentValue;
+  });
+}
+
 export class PersistenceService {
   /**
    * Finalizes an ImportJob by processing all its rows through the DecisionEngine with user resolutions
@@ -92,7 +101,7 @@ export class PersistenceService {
               entityId: importJobId,
               action: "RESOLVE_ANOMALY",
               performedBy: resolvedByUserId,
-              afterState: { rowNumber: rowNum, note }
+              afterState: jsonStringify({ rowNumber: rowNum, note })
             }
           });
         }
@@ -135,10 +144,10 @@ export class PersistenceService {
               groupId,
               title: finalizedRow.description || `Imported Row ${rowNum}`,
               description: finalizedRow.notes || null,
-              amount: new Decimal(finalizedRow.originalAmount),
+              amount: finalizedRow.originalAmount,
               currency: finalizedRow.currency,
-              exchangeRate: new Decimal(finalizedRow.exchangeRate),
-              normalizedAmount: new Decimal(finalizedRow.normalizedAmount),
+              exchangeRate: finalizedRow.exchangeRate,
+              normalizedAmount: finalizedRow.normalizedAmount,
               paidBy: payerId,
               expenseDate: finalizedRow.date,
               splitType: finalizedRow.splitType || "equal",
@@ -152,9 +161,9 @@ export class PersistenceService {
               data: {
                 expenseId: expense.id,
                 userId: s.userId,
-                sharePercentage: s.sharePercentage !== null ? new Decimal(s.sharePercentage) : null,
-                shareAmount: new Decimal(s.shareAmount),
-                shareWeight: s.shareWeight !== null ? new Decimal(s.shareWeight) : null
+                sharePercentage: s.sharePercentage,
+                shareAmount: s.shareAmount,
+                shareWeight: s.shareWeight
               }
             });
           }
@@ -179,7 +188,7 @@ export class PersistenceService {
               groupId,
               payerId,
               receiverId,
-              amount: new Decimal(finalizedRow.normalizedAmount),
+              amount: finalizedRow.normalizedAmount,
               currency: finalizedRow.currency,
               settlementDate: finalizedRow.date
             }
@@ -194,12 +203,12 @@ export class PersistenceService {
         data: {
           status: "COMPLETED",
           completedAt: new Date(),
-          summary: {
+          summary: jsonStringify({
             rowsProcessed,
             expensesCreated,
             settlementsCreated
-          }
-        } as any,
+          })
+        },
         where: { id: importJobId }
       });
     });
