@@ -1,6 +1,6 @@
 datasource db {
-  provider = "sqlite"
-  url      = "file:./dev.db"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 generator client {
@@ -8,7 +8,7 @@ generator client {
 }
 
 model User {
-  id           String            @id @default(uuid())
+  id           String            @id @default(uuid()) @db.Uuid
   name         String
   email        String            @unique
   passwordHash String
@@ -24,9 +24,9 @@ model User {
 }
 
 model Group {
-  id        String   @id @default(uuid())
+  id        String   @id @default(uuid()) @db.Uuid
   name      String
-  createdBy String
+  createdBy String   @db.Uuid
   createdAt DateTime @default(now())
   
   // Relations
@@ -37,9 +37,9 @@ model Group {
 }
 
 model GroupMembership {
-  id       String    @id @default(uuid())
-  groupId  String
-  userId   String
+  id       String    @id @default(uuid()) @db.Uuid
+  groupId  String    @db.Uuid
+  userId   String    @db.Uuid
   joinedAt DateTime
   leftAt   DateTime?
   
@@ -51,15 +51,15 @@ model GroupMembership {
 }
 
 model Expense {
-  id               String               @id @default(uuid())
-  groupId          String
+  id               String               @id @default(uuid()) @db.Uuid
+  groupId          String               @db.Uuid
   title            String
   description      String?
-  amount           Float
+  amount           Decimal              @db.Decimal(12, 2)
   currency         String               @default("INR")
-  exchangeRate     Float                @default(1.0)
-  normalizedAmount Float
-  paidBy           String
+  exchangeRate     Decimal              @default(1.0) @db.Decimal(10, 4)
+  normalizedAmount Decimal              @db.Decimal(12, 2)
+  paidBy           String               @db.Uuid
   expenseDate      DateTime
   splitType        String               // equal, percentage, exact, share, weight
   imported         Boolean              @default(false)
@@ -73,12 +73,12 @@ model Expense {
 }
 
 model ExpenseParticipant {
-  id              String   @id @default(uuid())
-  expenseId       String
-  userId          String
-  sharePercentage Float?
-  shareAmount     Float
-  shareWeight     Float?
+  id              String   @id @default(uuid()) @db.Uuid
+  expenseId       String   @db.Uuid
+  userId          String   @db.Uuid
+  sharePercentage Decimal? @db.Decimal(5, 2)
+  shareAmount     Decimal  @db.Decimal(12, 2)
+  shareWeight     Decimal? @db.Decimal(10, 4)
   
   // Relations
   expense Expense @relation(fields: [expenseId], references: [id], onDelete: Cascade)
@@ -88,11 +88,11 @@ model ExpenseParticipant {
 }
 
 model Settlement {
-  id             String    @id @default(uuid())
-  groupId        String
-  payerId        String
-  receiverId     String
-  amount         Float
+  id             String    @id @default(uuid()) @db.Uuid
+  groupId        String    @db.Uuid
+  payerId        String    @db.Uuid
+  receiverId     String    @db.Uuid
+  amount         Decimal   @db.Decimal(12, 2)
   currency       String    @default("INR")
   settlementDate DateTime
   createdAt      DateTime  @default(now())
@@ -105,31 +105,31 @@ model Settlement {
 }
 
 model ImportJob {
-  id           String          @id @default(uuid())
+  id           String          @id @default(uuid()) @db.Uuid
   rawFileName  String
   rawFileHash  String
   status       String          // UPLOADED, ANALYZING, REVIEW_REQUIRED, APPROVED, IMPORTING, COMPLETED, FAILED
   uploadedAt   DateTime        @default(now())
   startedAt    DateTime?
   completedAt  DateTime?
-  summary      String?         // SQLite does not support JSON, so we store it as a JSON string
+  summary      Json?           // { rowsProcessed, expensesCreated, settlementsCreated, duplicatesDetected, warnings, errors, blocking }
   
   // Relations
   anomalies ImportAnomaly[]
 }
 
 model ImportAnomaly {
-  id                String    @id @default(uuid())
-  importJobId       String
+  id                String    @id @default(uuid()) @db.Uuid
+  importJobId       String    @db.Uuid
   rowNumber         Int
   fingerprint       String
   severity          String    // INFO, WARNING, ERROR, BLOCKING
   anomalyType       String
   description       String
-  rawRow            String    // SQLite does not support JSON, so store as JSON string
-  normalizedRow     String?   // JSON string
+  rawRow            Json
+  normalizedRow     Json?
   status            String    @default("PENDING") // PENDING, APPROVED, REJECTED, RESOLVED
-  resolvedBy        String?
+  resolvedBy        String?   @db.Uuid
   resolvedAt        DateTime?
   resolutionNote    String?
   policyType        String?   // DUPLICATE, CURRENCY, SETTLEMENT, MEMBERSHIP
@@ -141,12 +141,12 @@ model ImportAnomaly {
 }
 
 model AuditLog {
-  id          String   @id @default(uuid())
+  id          String   @id @default(uuid()) @db.Uuid
   entityType  String
-  entityId    String
+  entityId    String   @db.Uuid
   action      String
-  performedBy String?
-  beforeState String?  // JSON string
-  afterState  String?  // JSON string
+  performedBy String?  @db.Uuid
+  beforeState Json?
+  afterState  Json?
   createdAt   DateTime @default(now())
 }
