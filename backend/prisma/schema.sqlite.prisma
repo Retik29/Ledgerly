@@ -112,7 +112,7 @@ model ImportJob {
   uploadedAt   DateTime        @default(now())
   startedAt    DateTime?
   completedAt  DateTime?
-  summary      String?         // SQLite does not support JSON, so we store it as a JSON string
+  summary      String?         // Stored as stringified JSON
   
   // Relations
   anomalies ImportAnomaly[]
@@ -126,8 +126,8 @@ model ImportAnomaly {
   severity          String    // INFO, WARNING, ERROR, BLOCKING
   anomalyType       String
   description       String
-  rawRow            String    // SQLite does not support JSON, so store as JSON string
-  normalizedRow     String?   // JSON string
+  rawRow            String    // Stored as stringified JSON
+  normalizedRow     String?   // Stored as stringified JSON
   status            String    @default("PENDING") // PENDING, APPROVED, REJECTED, RESOLVED
   resolvedBy        String?
   resolvedAt        DateTime?
@@ -146,7 +146,7 @@ model AuditLog {
   entityId    String
   action      String
   performedBy String?
-  beforeState String?  // JSON string
-  afterState  String?  // JSON string
+  beforeState String?  // Stored as stringified JSON
+  afterState  String?  // Stored as stringified JSON
   createdAt   DateTime @default(now())
 }

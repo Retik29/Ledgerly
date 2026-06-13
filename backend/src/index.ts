@@ -12,6 +12,7 @@ import expensesRouter from "./expenses/expenses";
 import settlementsRouter from "./settlements/settlements";
 import balancesRouter from "./balances/balances";
 import importsRouter from "./imports/imports";
+import adminRouter from "./admin/admin";
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -37,6 +38,7 @@ app.use("/expenses", expensesRouter);
 app.use("/settlements", settlementsRouter);
 app.use("/balances", balancesRouter);
 app.use("/imports", importsRouter);
+app.use("/admin", adminRouter);
 
 // Global Error Handler
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {

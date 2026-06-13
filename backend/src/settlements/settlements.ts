@@ -86,8 +86,8 @@ router.delete("/:id", async (req: AuthenticatedRequest, res: Response) => {
         entityId: id,
         action: "SOFT_DELETE",
         performedBy: req.user?.id,
-        beforeState: { amount: settlement.amount, deletedAt: null },
-        afterState: { amount: settlement.amount, deletedAt: updated.deletedAt }
+        beforeState: JSON.stringify({ amount: settlement.amount, deletedAt: null }),
+        afterState: JSON.stringify({ amount: settlement.amount, deletedAt: updated.deletedAt })
       }
     });
 
