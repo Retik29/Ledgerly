@@ -84,6 +84,7 @@ router.patch("/membership/:id", async (req: AuthenticatedRequest, res: Response)
         joinedAt: joinedAt ? new Date(joinedAt) : undefined,
         leftAt: leftAt ? new Date(leftAt) : null // allows clearing leftAt
       },
+      where: { id },
       include: {
         user: { select: { id: true, name: true, email: true } }
       }
@@ -114,6 +115,7 @@ router.delete("/membership/:id", async (req: AuthenticatedRequest, res: Response
       data: {
         leftAt: leftAt ? new Date(leftAt) : new Date()
       },
+      where: { id },
       include: {
         user: { select: { id: true, name: true, email: true } }
       }

@@ -32,8 +32,8 @@ yarn-debug.log*
 yarn-error.log*
 
 # Database
-prisma/*.db
-prisma/*.db-journal
+**/prisma/*.db
+**/prisma/*.db-journal
 
 # OS files
 .DS_Store

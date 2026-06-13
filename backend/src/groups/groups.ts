@@ -1,6 +1,7 @@
 import { Router, Response } from "express";
 import { prisma } from "../shared/prisma";
 import { AuthenticatedRequest, authMiddleware } from "../shared/authMiddleware";
+import { BalanceEngine } from "../balances/balanceEngine";
 
 const router = Router();
 
@@ -69,8 +70,41 @@ router.get("/", async (req: AuthenticatedRequest, res: Response) => {
       }
     });
 
-    const groups = memberships.map(m => m.group);
-    return res.json(groups);
+    // Compute totalSpent and user's net position for each group
+    const groupsWithBalances = await Promise.all(
+      memberships.map(async (m) => {
+        const g = m.group;
+
+        // Fetch active expenses to calculate total spent
+        const expenses = await prisma.expense.findMany({
+          where: { groupId: g.id, deletedAt: null },
+          include: { participants: true }
+        });
+
+        // Fetch active settlements
+        const settlements = await prisma.settlement.findMany({
+          where: { groupId: g.id, deletedAt: null }
+        });
+
+        const groupUsers = g.memberships.map((gm) => ({
+          id: gm.userId,
+          name: gm.user.name
+        }));
+
+        const summaries = BalanceEngine.computeBalances(groupUsers, expenses, settlements);
+        const userSummary = summaries.find((s) => s.userId === userId);
+        const userNetBalance = userSummary ? userSummary.netBalance : 0;
+        const totalSpent = expenses.reduce((sum, e) => sum + e.normalizedAmount, 0);
+
+        return {
+          ...g,
+          totalSpent,
+          userNetBalance
+        };
+      })
+    );
+
+    return res.json(groupsWithBalances);
   } catch (err: any) {
     console.error("Get groups error:", err);
     return res.status(500).json({ error: "Failed to fetch groups." });

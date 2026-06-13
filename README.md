@@ -9,28 +9,66 @@ A production-grade shared expense application capable of importing a deliberatel
 - **Database**: PostgreSQL (Neon in production, SQLite dev fallback)
 - **Deployment**: Vercel (Frontend), Railway (Backend), Neon (Database)
 
-## Architecture
+## Architecture Diagram
 
 ```text
-       Frontend (React + TS)
-                │
-                ▼ (Axios API calls)
-       Backend (Express + TS)
-                │
-                ├─► Anomaly Engine (Pluggable Rules)
-                ├─► Decision Engine (Versioned Policies)
-                ├─► Balance & Debt Engine (Min Cash Flow)
-                ▼
-      PostgreSQL / SQLite Database (via Prisma ORM)
+               +───────────────────────────+
+               │   Frontend (React + TS)   │
+               +─────────────┬─────────────+
+                             │
+                             │ (Axios HTTPS Requests)
+                             ▼
+               +───────────────────────────+
+               │   Backend (Express + TS)  │
+               +─────────────┬─────────────+
+                             │
+       ┌─────────────────────┼─────────────────────┐
+       ▼                     ▼                     ▼
++──────────────+      +──────────────+      +──────────────+
+│Anomalies     │      │Decision      │      │Balance & Debt│
+│Engine        │      │Engine        │      │Engine        │
++──────────────+      +──────────────+      +──────────────+
+       │                     │                     │
+       └─────────────────────┼─────────────────────┘
+                             ▼
+               +───────────────────────────+
+               │   Prisma ORM Interface    │
+               +─────────────┬─────────────+
+                             │
+                             ▼
+               +───────────────────────────+
+               │  PostgreSQL / SQLite DB   │
+               +───────────────────────────+
 ```
 
-## Features
+## Import Lifecycle
 
-1. **Pluggable Anomaly Engine**: Detects duplicates, fuzzy duplicates (using Levenshtein Distance), missing currency, negative refund amounts, unknown users, missing payers, and invalid split sums.
-2. **Interactive Preview Queue**: Anomalies are surfaced for manual human-in-the-loop review. Users map users, choose date formats, approve duplicates, or convert settlements.
-3. **Soft Membership History**: Automatically excludes members from splits if they were not active on the expense date (`joinedAt <= date AND (leftAt IS NULL OR date <= leftAt)`).
-4. **Explainable Balances & Audit Trail**: Users can click any balance to inspect the exact transactions, payments, and settlements that compose their balance.
-5. **Debt Simplification**: Implements a Cash Flow Minimization algorithm.
+```text
+Raw CSV File Uploaded
+      │
+      ▼
+Parsed into Raw Objects (preserves row numbers)
+      │
+      ▼
+Normalized (trim names, check currencies, format unambiguous dates)
+      │
+      ▼
+Anomaly Check (runs duplicate, date, user, currency, and membership checks)
+      │
+      ▼
+Review Queue (human-in-the-loop maps users, overrides exchange rates, resolves conflicts)
+      │
+      ▼
+Finalized & Committed (within atomic database transaction, rounding penny adjusted)
+      │
+      ▼
+Net Balances Recalculation & Cash Flow Minimization Debt Plan
+```
+
+## Known Limitations
+
+- **Floating Point Precision**: SQLite doesn't natively support Decimal types. We enforce type compatibility by using standard `Float` double-precision numbers across both environments, which are rounded to 2 decimal places client-side and server-side to guarantee precision.
+- **Concurrent Imports**: Simultaneous uploads of identical files by different users are queued; however, hash-based regression block checks prevent duplicate persistence.
 
 ## Setup Instructions
 
@@ -55,8 +93,6 @@ A production-grade shared expense application capable of importing a deliberatel
    ```
    *(Running at `http://localhost:4000`)*
 
-*Note: To run on PostgreSQL instead of SQLite, execute `node prisma/switch-db.js postgres` and update the `DATABASE_URL` in `.env` before running migrations.*
-
 ### Frontend Setup
 
 1. Navigate to the frontend directory:
@@ -72,13 +108,3 @@ A production-grade shared expense application capable of importing a deliberatel
    npm run dev
    ```
    *(Running at `http://localhost:5173`)*
-
-## Deployment
-
-- **Database**: Neon (PostgreSQL serverless)
-- **Backend**: Railway (Express server)
-- **Frontend**: Vercel (React static SPA)
-
-## AI Tools Used
-
-- **Antigravity by DeepMind**: Employed for codebase architecture design, backend coding, React frontend compilation, and database schema refinement.

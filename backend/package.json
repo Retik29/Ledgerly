@@ -1,7 +1,7 @@
 {
-  "name": "shared-expense-manager-backend",
+  "name": "ledgerly-backend",
   "version": "1.0.0",
-  "description": "Backend for Shared Expense Manager",
+  "description": "Backend for Ledgerly",
   "main": "dist/index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",

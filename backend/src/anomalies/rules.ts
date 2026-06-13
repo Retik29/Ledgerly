@@ -1,6 +1,8 @@
 import { RawCsvRow, NormalizedRow, AnomalyResult } from "../imports/types";
 
 export interface ImportContext {
+  groupId: string;
+  userMap: { [name: string]: string };
   existingUsers: string[]; // List of user names registered in database
   memberships: {
     [userName: string]: { joinedAt: Date; leftAt: Date | null }[];
@@ -59,12 +61,20 @@ export class DuplicateRule implements AnomalyRule {
   detect(raw: RawCsvRow, normalized: NormalizedRow, context: ImportContext): AnomalyResult[] {
     const anomalies: AnomalyResult[] = [];
     const dateStr = normalized.date ? normalized.date.toISOString().split("T")[0] : null;
-    if (!dateStr) return []; // Skip duplicate check if date is completely unparseable
+    const rawDateStr = normalized.rawDateStr ? normalized.rawDateStr.trim() : "";
 
     // Function to check matches against another expense
-    const checkMatch = (other: { date: Date; amount: number; paidBy: string; description: string; rowNumber?: number }, isDb: boolean) => {
-      const otherDateStr = other.date.toISOString().split("T")[0];
-      if (dateStr !== otherDateStr) return null;
+    const checkMatch = (other: { date: Date | null; rawDateStr?: string; amount: number; paidBy: string; description: string; rowNumber?: number }, isDb: boolean) => {
+      let dateMatches = false;
+      if (normalized.date && other.date) {
+        const otherDateStr = other.date.toISOString().split("T")[0];
+        dateMatches = dateStr === otherDateStr;
+      } else if (!normalized.date && !other.date) {
+        const otherRawDate = other.rawDateStr ? other.rawDateStr.trim() : "";
+        dateMatches = rawDateStr !== "" && rawDateStr === otherRawDate;
+      }
+
+      if (!dateMatches) return null;
 
       const amountMatches = Math.abs(normalized.originalAmount - other.amount) < 0.01;
       const payerMatches = normalized.paidBy.toLowerCase() === other.paidBy.toLowerCase();
@@ -86,10 +96,11 @@ export class DuplicateRule implements AnomalyRule {
     // Check against other rows in the same file
     for (const other of context.otherParsedRows) {
       if (other.rowNumber === normalized.rowNumber) continue;
-      if (!other.date) continue;
+      if (!other.date && !other.rawDateStr) continue;
 
       const match = checkMatch({
         date: other.date,
+        rawDateStr: other.rawDateStr,
         amount: other.originalAmount,
         paidBy: other.paidBy,
         description: other.description,
@@ -234,9 +245,10 @@ export class NegativeAmountRule implements AnomalyRule {
 // 6. Settlement Disguised as Expense Rule
 export class SettlementDisguisedAsExpenseRule implements AnomalyRule {
   detect(raw: RawCsvRow, normalized: NormalizedRow): AnomalyResult[] {
-    const keywords = ["repaid", "paid back", "settled", "returned", "returned back"];
+    const keywords = ["repaid", "settled", "settlement", "returned", "refund"];
     const descLower = normalized.description.toLowerCase();
-    const hasKeyword = keywords.some(k => descLower.includes(k));
+    const hasKeyword = keywords.some(k => descLower.includes(k)) ||
+                       (descLower.includes("paid") && descLower.includes("back"));
 
     if (hasKeyword) {
       return [{
@@ -279,6 +291,11 @@ export class MembershipViolationRule implements AnomalyRule {
 
     // Check split members
     for (const member of normalized.splitWith) {
+      // Log membership engine validation
+      const nameNorm = member.trim().charAt(0).toUpperCase() + member.trim().slice(1).toLowerCase();
+      const resolvedUserId = context.userMap[nameNorm] || "unknown";
+      console.log(`[MEMBERSHIP_VALIDATION] groupId=${context.groupId} expenseDate=${expenseDate.toISOString().split("T")[0]} participantName=${member} resolvedUserId=${resolvedUserId}`);
+
       // Only check membership if the user actually exists in database
       if (context.existingUsers.includes(member)) {
         if (!checkMemberActive(member)) {

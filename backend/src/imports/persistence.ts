@@ -52,27 +52,27 @@ export class PersistenceService {
 
     // Run persistence inside a single database transaction
     await prisma.$transaction(async (tx) => {
-      // 1. Fetch resolved anomalies for mapping names or overriding values
-      // Map resolutions by fingerprint for quick lookup
-      const resolutionMap = new Map<string, ResolvedAnomaly>();
+      // Build a global alias map from ALL MAPPED_USER resolutions: { "Dev's friend kabir" -> "Dev" }
+      // This is the fallback for any name that DecisionEngine missed remapping.
+      const globalAlias: Record<string, string> = {};
       for (const res of resolutions) {
-        // Find fingerprint if possible (we can match by type and rowNumber)
-        const fp = `${res.anomalyType}_ROW_${rawRows[0]?.rowNumber}`; // placeholder, better lookup by fingerprint
+        if (res.resolutionAction === "MAPPED_USER" && res.resolutionDetails?.from !== undefined && res.resolutionDetails?.to) {
+          const aliasFrom = Normalizer.normalizeName(res.resolutionDetails.from || "");
+          const aliasTo   = Normalizer.normalizeName(res.resolutionDetails.to);
+          if (aliasFrom) globalAlias[aliasFrom] = aliasTo;
+          // Also store un-normalized key so raw names match
+          const rawFrom = (res.resolutionDetails.from as string).trim();
+          if (rawFrom) globalAlias[rawFrom] = res.resolutionDetails.to as string;
+        }
       }
 
-      // Group resolutions by row number
+      // Group resolutions by row number (extracted from fingerprint e.g. UNKNOWN_USER_FOO_ROW_23)
       const rowResolutionsMap = new Map<number, ResolvedAnomaly[]>();
       for (const res of resolutions) {
-        // Assuming we pass fingerprint inside resolution, e.g. "UNKNOWN_USER_PRIYA_S_ROW_11"
-        const rowNumMatch = res.anomalyType.includes("ROW_") 
-          ? res.anomalyType.match(/ROW_(\d+)/) 
-          : null;
-        
-        // Let's pass the fingerprint directly from resolutions list
-        // and extract row number from it
-        const match = res.anomalyType.match(/_ROW_(\d+)/) || res.anomalyType.match(/_ROW_(\d+)_/);
+        if (!res.anomalyType) continue;
+        const match = res.anomalyType.match(/_ROW_(\d+)/);
         if (match) {
-          const rowNum = parseInt(match[1], 10);
+          const rowNum = parseInt(match[match.length - 1], 10);
           const list = rowResolutionsMap.get(rowNum) || [];
           list.push(res);
           rowResolutionsMap.set(rowNum, list);
@@ -110,15 +110,30 @@ export class PersistenceService {
           continue; // Skip this row
         }
 
-        // Map names to user IDs
+        // Map names to user IDs — three tiers:
+        // 1. Direct lookup by normalized name
+        // 2. Follow globalAlias (from MAPPED_USER resolutions) then look up
+        // 3. Throw only if both fail
         const getUserId = (name: string): string => {
           const normalizedName = Normalizer.normalizeName(name);
-          const id = userMap[normalizedName];
-          if (!id) {
-            throw new Error(`User mapping missing for user '${name}' on row ${rowNum}`);
+          let id = userMap[normalizedName];
+          if (id) return id;
+
+          // Tier 2: check global alias map (covers cases DecisionEngine missed)
+          const aliasedName = globalAlias[name] || globalAlias[normalizedName];
+          if (aliasedName) {
+            const aliasedNorm = Normalizer.normalizeName(aliasedName);
+            id = userMap[aliasedNorm];
+            if (id) {
+              console.log(`[PERSISTENCE] Alias fallback: '${name}' → '${aliasedName}' on row ${rowNum}`);
+              return id;
+            }
           }
-          return id;
+
+          throw new Error(`User '${name}' on row ${rowNum} could not be resolved. Please map this user in the anomaly resolution queue before finalizing.`);
+
         };
+
 
         if (action === "PERSIST_EXPENSE") {
           // Verify date is set
@@ -127,14 +142,42 @@ export class PersistenceService {
           }
 
           const payerId = getUserId(finalizedRow.paidBy);
-          const splitUserIds = finalizedRow.splitWith.map(member => getUserId(member));
+
+          // Resolve all split members to user IDs, deduplicate if mapping caused collisions
+          // e.g. "Dev's friend kabir" → "Dev" AND "Dev" already in list → merge
+          const seenUserIds = new Set<string>();
+          const dedupedSplitWith: string[] = [];
+          const dedupedSplitDetails: { [name: string]: number } = {};
+
+          for (const member of finalizedRow.splitWith) {
+            const uid = getUserId(member);
+            if (seenUserIds.has(uid)) {
+              // Merge: find the existing name for this userId and add shares
+              const existingName = dedupedSplitWith.find(n => {
+                try { return getUserId(n) === uid; } catch { return false; }
+              });
+              if (existingName && finalizedRow.splitDetails[member] !== undefined) {
+                dedupedSplitDetails[existingName] = (dedupedSplitDetails[existingName] || 0) + (finalizedRow.splitDetails[member] || 0);
+              }
+              console.log(`[PERSISTENCE] Merged duplicate participant '${member}' (same userId as existing entry) on row ${rowNum}`);
+            } else {
+              seenUserIds.add(uid);
+              dedupedSplitWith.push(member);
+              if (finalizedRow.splitDetails[member] !== undefined) {
+                dedupedSplitDetails[member] = finalizedRow.splitDetails[member];
+              }
+            }
+          }
+
+          const deduped = { ...finalizedRow, splitWith: dedupedSplitWith, splitDetails: dedupedSplitDetails };
+          const splitUserIds = deduped.splitWith.map(member => getUserId(member));
 
           // Calculate participant shares
           const shares = this.calculateShares(
-            finalizedRow.normalizedAmount,
-            finalizedRow.splitType,
+            deduped.normalizedAmount,
+            deduped.splitType,
             splitUserIds,
-            finalizedRow.splitDetails,
+            deduped.splitDetails,
             userMap
           );
 

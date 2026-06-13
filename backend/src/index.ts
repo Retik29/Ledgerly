@@ -48,5 +48,5 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 
 // Start Server
 app.listen(PORT, () => {
-  console.log(`🚀 Shared Expense Manager Backend running on port ${PORT}`);
+  console.log(`🚀 Ledgerly Backend running on port ${PORT}`);
 });

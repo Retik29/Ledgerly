@@ -3,7 +3,8 @@ import { api } from "./services/api";
 import { 
   Users, Plus, Upload, Trash2, ArrowRight, UserCheck, AlertTriangle, AlertOctagon, 
   CheckCircle, ArrowLeftRight, HelpCircle, LogOut, Check, RefreshCw, Info, Calendar, FileText,
-  Search, Eye, ShieldAlert, History, Activity, Database, CheckSquare, Layers
+  Search, Eye, ShieldAlert, History, Activity, Database, CheckSquare, Layers,
+  UploadCloud, CreditCard, Clock, ArrowUpRight, ArrowDownRight, Sparkles, FileSpreadsheet
 } from "lucide-react";
 
 // Types
@@ -84,6 +85,7 @@ interface SimplifiedDebt {
 
 interface ImportJob {
   id: string;
+  groupId: string | null;
   rawFileName: string;
   rawFileHash: string;
   status: string;
@@ -96,6 +98,7 @@ interface ImportJob {
     errorsFound: number;
   } | null;
   anomalies?: ImportAnomaly[];
+  anomaliesCount?: number;
 }
 
 interface ImportAnomaly {
@@ -122,6 +125,40 @@ interface AuditLog {
   afterState: any;
   createdAt: string;
 }
+
+const GroupSkeleton = () => (
+  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 animate-pulse">
+    {[1, 2].map(i => (
+      <div key={i} className="p-5 bg-white border border-slate-200 rounded-xl space-y-4 shadow-sm">
+        <div className="space-y-2">
+          <div className="h-4 bg-slate-200 rounded w-2/3"></div>
+          <div className="h-3 bg-slate-100 rounded w-1/3"></div>
+        </div>
+        <div className="border-t border-slate-100 pt-3 flex justify-between items-center">
+          <div className="flex space-x-1">
+            <div className="w-5 h-5 bg-slate-200 rounded-full"></div>
+            <div className="w-5 h-5 bg-slate-200 rounded-full"></div>
+          </div>
+          <div className="h-4 bg-slate-100 rounded w-1/4"></div>
+        </div>
+      </div>
+    ))}
+  </div>
+);
+
+const SnapshotSkeleton = () => (
+  <div className="grid grid-cols-1 md:grid-cols-2 gap-6 animate-pulse">
+    {[1, 2].map(i => (
+      <div key={i} className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm space-y-3">
+        <div className="h-4 bg-slate-200 rounded w-2/3 animate-pulse"></div>
+        <div className="space-y-2">
+          <div className="h-10 bg-slate-50 border border-slate-100 rounded-lg"></div>
+          <div className="h-10 bg-slate-50 border border-slate-100 rounded-lg"></div>
+        </div>
+      </div>
+    ))}
+  </div>
+);
 
 export default function App() {
   const [token, setToken] = useState<string | null>(localStorage.getItem("token"));
@@ -164,6 +201,30 @@ export default function App() {
   const [settleReceiver, setSettleReceiver] = useState("");
   const [settleAmount, setSettleAmount] = useState("");
   const [settleDate, setSettleDate] = useState(new Date().toISOString().split("T")[0]);
+
+  // Feedback Layer & Loading Skeletons State
+  const [loadingGroups, setLoadingGroups] = useState(false);
+  const [loadingBalances, setLoadingBalances] = useState(false);
+  const [loadingDetails, setLoadingDetails] = useState(false);
+  const [toasts, setToasts] = useState<{ id: string; message: string; type: "success" | "error" | "warning" }[]>([]);
+
+  // Stepper & Anomaly Severity Tab Filtering
+  const [importStep, setImportStep] = useState<1 | 2 | 3 | 4 | 5 | 6>(1);
+  const [anomalyTab, setAnomalyTab] = useState<"ALL" | "BLOCKING" | "ERROR" | "WARNING" | "INFO">("ALL");
+
+  // Global Cross-Group balances snapshot state
+  const [globalBalances, setGlobalBalances] = useState<{ creditors: any[]; debtors: any[] } | null>(null);
+  const [importStartTime, setImportStartTime] = useState<number | null>(null);
+  const [showOptimized, setShowOptimized] = useState(true);
+  const [selectedImportJob, setSelectedImportJob] = useState<any | null>(null);
+
+  const showToast = (message: string, type: "success" | "error" | "warning" = "success") => {
+    const id = Math.random().toString(36).substring(2, 9);
+    setToasts(prev => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id));
+    }, 4000);
+  };
 
   // Import State
   const [importJobs, setImportJobs] = useState<ImportJob[]>([]);
@@ -263,12 +324,30 @@ export default function App() {
     }
   };
 
+  const fetchGlobalBalances = async () => {
+    setLoadingBalances(true);
+    try {
+      const res = await api.get("/balances/global");
+      setGlobalBalances(res.data);
+    } catch (err) {
+      console.error("Fetch global balances error:", err);
+    } finally {
+      setLoadingBalances(false);
+    }
+  };
+
   const fetchGroups = async () => {
+    setLoadingGroups(true);
     try {
       const res = await api.get("/groups");
       setGroups(res.data);
+      if (token) {
+        fetchGlobalBalances();
+      }
     } catch (err) {
       console.error(err);
+    } finally {
+      setLoadingGroups(false);
     }
   };
 
@@ -290,14 +369,23 @@ export default function App() {
     }
   };
 
+  const handleQuickAddExpense = async (groupId: string) => {
+    setSelectedGroupId(groupId);
+    await fetchGroupDetails(groupId);
+    setGroupTab("expenses");
+    setView("group-detail");
+  };
+
   const handleCreateGroup = async () => {
     if (!newGroupName.trim()) return;
     try {
       await api.post("/groups", { name: newGroupName });
       setNewGroupName("");
+      showToast("Group created successfully", "success");
       fetchGroups();
     } catch (err) {
       console.error(err);
+      showToast("Failed to create group", "error");
     }
   };
 
@@ -429,16 +517,58 @@ export default function App() {
     }
   };
 
+  const handleBulkIgnoreInfo = () => {
+    setImportResolutions(prev => {
+      const updated = { ...prev };
+      activeImportAnomalies.forEach(a => {
+        if (a.severity === "INFO") {
+          updated[a.fingerprint] = {
+            ...updated[a.fingerprint],
+            resolutionAction: "ACCEPTED_WARNING",
+            resolutionNote: "Bulk auto-ignored info severity alert"
+          };
+        }
+      });
+      return updated;
+    });
+    showToast("Ignored all info alerts", "success");
+  };
+
+  const handleBulkAutoResolveSafe = () => {
+    setImportResolutions(prev => {
+      const updated = { ...prev };
+      activeImportAnomalies.forEach(a => {
+        if (["MISSING_CURRENCY", "NEGATIVE_AMOUNT", "ZERO_AMOUNT", "MEMBERSHIP_VIOLATION"].includes(a.anomalyType) || a.severity === "WARNING") {
+          updated[a.fingerprint] = {
+            ...updated[a.fingerprint],
+            resolutionAction: "ACCEPTED_WARNING",
+            resolutionNote: "Bulk auto-resolved safe warning"
+          };
+        }
+      });
+      return updated;
+    });
+    showToast("Auto-resolved safe warnings", "success");
+  };
+
   const handleUploadCsv = async () => {
     if (!importFile || !importCsvContent || !selectedGroupId) return;
     setImportError("");
     setImportStats(null);
-    setDiagnosticsLogs([]); // clear log panel
-
-    // Initialize diagnostic stage log
+    setDiagnosticsLogs([]); 
+    setImportStartTime(Date.now());
+    setView("import");
+    
+    // Step 2: Parsing
+    setImportStep(2);
     addDiagnosticsLog("REQUEST_VALIDATION", { filename: importFile.name, size: importFile.size });
 
     try {
+      // Small simulated delay for premium UX
+      await new Promise(resolve => setTimeout(resolve, 600));
+      
+      // Step 3: Anomaly Detection
+      setImportStep(3);
       addDiagnosticsLog("DUPLICATE_CHECK", { checkingDb: true });
       addDiagnosticsLog("CSV_PARSER", { parsing: true });
 
@@ -453,25 +583,33 @@ export default function App() {
         anomalies: res.data.anomalies
       });
 
+      // Small delay before review
+      await new Promise(resolve => setTimeout(resolve, 600));
+
       setActiveImportJobId(res.data.jobId);
       setActiveImportAnomalies(res.data.anomalies);
       
-      // Initialize resolutions
       const initialResolutions: any = {};
       res.data.anomalies.forEach((a: ImportAnomaly) => {
         initialResolutions[a.fingerprint] = {
           anomalyType: a.fingerprint,
+          fingerprint: a.fingerprint,
           resolutionAction: a.severity === "INFO" ? "ACCEPTED_WARNING" : null,
           resolutionNote: "",
           resolutionDetails: {}
         };
       });
       setImportResolutions(initialResolutions);
-      setView("import");
+      
+      // Step 4: Review Queue
+      setImportStep(4);
     } catch (err: any) {
       const errData = err.response?.data;
       addDiagnosticsLog(errData?.stage || "SERVER_CRASH", { error: errData?.message || err.message });
       setImportError(errData?.message || "Failed to analyze CSV file.");
+      setImportStep(1);
+      setView("group-detail");
+      showToast(errData?.message || "Failed to analyze CSV file", "error");
     }
   };
 
@@ -509,19 +647,24 @@ export default function App() {
   const handleFinalizeImport = async () => {
     if (!activeImportJobId || !selectedGroupId) return;
     
-    // Check if there are any PENDING resolutions for non-INFO severities
     const unresolved = activeImportAnomalies.some(a => {
       const res = importResolutions[a.fingerprint];
       return !res || res.resolutionAction === null;
     });
 
     if (unresolved) {
-      alert("Please resolve all anomalies in the review queue before proceeding.");
+      showToast("Please resolve all anomalies in the review queue before proceeding.", "warning");
       return;
     }
 
+    // Step 5: Finalizing
+    setImportStep(5);
     try {
       addDiagnosticsLog("PERSISTENCE", { finalizing: true });
+      
+      // Simulated processing delay for premium UX
+      await new Promise(resolve => setTimeout(resolve, 800));
+
       const res = await api.post(`/imports/jobs/${activeImportJobId}/resolve`, {
         groupId: selectedGroupId,
         csvContent: importCsvContent,
@@ -529,14 +672,88 @@ export default function App() {
       });
       setImportStats(res.data.summary);
       addDiagnosticsLog("COMPLETED", res.data.summary);
+      
+      // Step 6: Completed
+      setImportStep(6);
+      showToast("Import completed successfully!", "success");
       fetchImportJobs();
       fetchGroupDetails(selectedGroupId);
     } catch (err: any) {
       const errData = err.response?.data;
       addDiagnosticsLog(errData?.stage || "PERSISTENCE_FAILED", { error: errData?.message || err.message });
-      alert(errData?.message || "Import persistence failed");
+      showToast(errData?.message || "Import persistence failed", "error");
+      setImportStep(4); // Back to review queue
     }
   };
+
+  // Memoized unminimized (raw) debts calculated directly from expenses and settlements
+  const rawDebts = useMemo(() => {
+    if (!selectedGroup) return [];
+    
+    const memberMap = new Map<string, string>();
+    selectedGroup.memberships.forEach(m => {
+      memberMap.set(m.user.id, m.user.name);
+    });
+    
+    const debtMatrix: { [from: string]: { [to: string]: number } } = {};
+    
+    const addDebt = (from: string, to: string, amt: number) => {
+      if (from === to || amt <= 0.01) return;
+      if (!debtMatrix[from]) debtMatrix[from] = {};
+      debtMatrix[from][to] = (debtMatrix[from][to] || 0) + amt;
+    };
+    
+    // 1. Process expenses
+    expenses.forEach(exp => {
+      const payerId = exp.payer?.id;
+      const payerName = exp.payer?.name;
+      if (!payerName || !payerId) return;
+      
+      exp.participants.forEach(part => {
+        const debtorId = part.user?.id;
+        const debtorName = part.user?.name;
+        if (!debtorName || !debtorId || debtorId === payerId) return;
+        
+        const share = typeof part.shareAmount === 'number' ? part.shareAmount : parseFloat(part.shareAmount as any) || 0;
+        addDebt(debtorName, payerName, share);
+      });
+    });
+    
+    // 2. Process settlements
+    settlements.forEach(settle => {
+      const payerName = settle.payer?.name;
+      const receiverName = settle.receiver?.name;
+      if (!payerName || !receiverName) return;
+      
+      const amt = typeof settle.amount === 'number' ? settle.amount : parseFloat(settle.amount as any) || 0;
+      addDebt(payerName, receiverName, -amt); 
+    });
+    
+    // 3. Flatten and net out between pairs
+    const flattened: { fromUser: string; toUser: string; amount: number }[] = [];
+    const keys = Object.keys(debtMatrix);
+    const visitedPairs = new Set<string>();
+    
+    keys.forEach(from => {
+      Object.keys(debtMatrix[from]).forEach(to => {
+        const pairKey = [from, to].sort().join("::");
+        if (visitedPairs.has(pairKey)) return;
+        visitedPairs.add(pairKey);
+        
+        const debt1 = debtMatrix[from][to] || 0;
+        const debt2 = debtMatrix[to]?.[from] || 0;
+        const net = debt1 - debt2;
+        
+        if (net > 0.01) {
+          flattened.push({ fromUser: from, toUser: to, amount: parseFloat(net.toFixed(2)) });
+        } else if (net < -0.01) {
+          flattened.push({ fromUser: to, toUser: from, amount: parseFloat(Math.abs(net).toFixed(2)) });
+        }
+      });
+    });
+    
+    return flattened;
+  }, [selectedGroup, expenses, settlements]);
 
   // Memoized filtered and sorted expenses
   const processedExpenses = useMemo(() => {
@@ -567,20 +784,79 @@ export default function App() {
   }, [expenses, expenseSearch, expenseSortField, expenseSortOrder]);
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans antialiased selection:bg-blue-600 selection:text-white">
+    <div className="min-h-screen bg-[#F8FAFC] text-[#0F172A] flex flex-col font-sans antialiased selection:bg-blue-600 selection:text-white">
+      {/* Toast Notifications */}
+      {toasts.length > 0 && (
+        <div className="fixed top-4 right-4 z-50 space-y-2 pointer-events-none">
+          {toasts.map(t => (
+            <div 
+              key={t.id} 
+              className={`flex items-center space-x-2 px-4 py-3 rounded-xl border text-xs font-semibold shadow-lg transition-all transform translate-y-0 opacity-100 max-w-sm pointer-events-auto ${
+                t.type === "success" ? "bg-green-50 border-green-200 text-green-800" :
+                t.type === "error" ? "bg-red-50 border-red-200 text-red-800" :
+                "bg-amber-50 border-amber-200 text-amber-805"
+              }`}
+            >
+              {t.type === "success" && <CheckCircle className="w-4 h-4 text-green-600 shrink-0" strokeWidth={1.5} />}
+              {t.type === "error" && <AlertOctagon className="w-4 h-4 text-red-600 shrink-0" strokeWidth={1.5} />}
+              {t.type === "warning" && <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" strokeWidth={1.5} />}
+              <span>{t.message}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Header */}
       <header className="border-b border-slate-200 bg-white sticky top-0 z-40 px-6 py-4 flex items-center justify-between shadow-sm">
-        <div className="flex items-center space-x-3 cursor-pointer" onClick={() => { setView(token ? "dashboard" : "login"); window.location.hash = ""; }}>
-          <div className="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center font-bold text-white shadow-sm">
-            S
+        <div className="flex items-center space-x-3 cursor-pointer" onClick={() => {
+          setView(token ? "dashboard" : "login");
+          window.location.hash = "";
+          setSelectedGroupId(null);
+          setSelectedGroup(null);
+          setActiveImportJobId(null);
+          setSelectedImportJob(null);
+          setActiveImportAnomalies([]);
+          setImportResolutions({});
+          setImportStats(null);
+        }}>
+          <div className="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center text-white shadow-sm shrink-0">
+            <CreditCard className="w-5 h-5" strokeWidth={1.5} />
           </div>
           <div>
-            <h1 className="font-extrabold text-lg tracking-tight text-slate-900">Shared Expense Manager</h1>
-            <p className="text-xs text-slate-500 font-medium">Spreetail Internship Assessment</p>
+            <h1 className="font-extrabold text-lg tracking-tight text-slate-900">Ledgerly</h1>
+            <p className="text-[10px] text-slate-500 font-medium">Fintech-grade expense reconciliation</p>
           </div>
         </div>
         
         <div className="flex items-center space-x-4">
+          {currentUser && groups.length > 0 && (
+            <div className="hidden md:flex items-center space-x-2">
+              <span className="text-[11px] font-bold text-slate-400">Active Group:</span>
+              <select 
+                value={selectedGroupId || ""}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (val === "") {
+                    setView("dashboard");
+                    setSelectedGroupId(null);
+                    setSelectedGroup(null);
+                  } else {
+                    setSelectedGroupId(val);
+                    fetchGroupDetails(val);
+                    setGroupTab("overview");
+                    setView("group-detail");
+                  }
+                }}
+                className="bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-650 cursor-pointer"
+              >
+                <option value="">Dashboard Overview</option>
+                {groups.map(g => (
+                  <option key={g.id} value={g.id}>{g.name}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
           {currentUser && (
             <>
               <button 
@@ -588,18 +864,18 @@ export default function App() {
                 className={`text-xs font-semibold px-3 py-1.5 rounded-lg border transition-all cursor-pointer flex items-center ${
                   view === "admin-demo"
                     ? "bg-blue-50 border-blue-200 text-blue-700 font-bold"
-                    : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
+                    : "bg-white border-slate-200 text-slate-655 hover:bg-slate-50"
                 }`}
               >
-                <Layers className="w-3.5 h-3.5 mr-1" /> Interview Demo Mode
+                <Layers className="w-3.5 h-3.5 mr-1" strokeWidth={1.5} /> Demo Mode
               </button>
-              <span className="text-sm font-medium text-slate-500">Hi, <b className="text-slate-900">{currentUser.name}</b></span>
+              <span className="text-xs font-medium text-slate-500">Hi, <b className="text-slate-900">{currentUser.name}</b></span>
               <button 
                 onClick={handleLogout}
-                className="p-2 rounded-lg bg-slate-100 hover:bg-slate-200 hover:text-red-600 text-slate-500 transition-all cursor-pointer"
+                className="p-2 rounded-lg bg-slate-100 hover:bg-slate-200 hover:text-red-600 text-slate-550 transition-all cursor-pointer"
                 title="Logout"
               >
-                <LogOut className="w-5 h-5" />
+                <LogOut className="w-4 h-4" strokeWidth={1.5} />
               </button>
             </>
           )}
@@ -744,6 +1020,80 @@ export default function App() {
               </div>
             </div>
 
+            {/* Balance Snapshot Section */}
+            <div className="space-y-4">
+              <h3 className="font-bold text-base text-slate-800 flex items-center">
+                <ArrowLeftRight className="w-4 h-4 mr-2 text-slate-500" strokeWidth={1.5} /> Balance Snapshot
+              </h3>
+              {loadingBalances ? (
+                <SnapshotSkeleton />
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  {/* Creditors Card (Owed to User) */}
+                  <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center space-x-2">
+                        <div className="p-2 bg-green-50 text-green-600 rounded-lg">
+                          <ArrowUpRight className="w-4 h-4" strokeWidth={1.5} />
+                        </div>
+                        <div>
+                          <h4 className="font-bold text-sm text-slate-800">People Who Owe You</h4>
+                          <p className="text-[10px] text-slate-400">Total outstanding receivables</p>
+                        </div>
+                      </div>
+                      <span className="font-extrabold text-base text-green-600">
+                        {globalBalances?.creditors?.reduce((sum: number, c: any) => sum + c.amount, 0).toLocaleString("en-IN", { style: "currency", currency: "INR" }) || "₹0.00"}
+                      </span>
+                    </div>
+
+                    <div className="space-y-2 max-h-[200px] overflow-y-auto pr-1">
+                      {!globalBalances || globalBalances.creditors?.length === 0 ? (
+                        <p className="text-xs text-slate-400 py-4 text-center">No outstanding receivables.</p>
+                      ) : (
+                        globalBalances.creditors?.map((c: any, idx: number) => (
+                          <div key={idx} className="flex items-center justify-between p-2.5 bg-green-50/20 border border-green-100 rounded-lg text-xs">
+                            <span className="font-semibold text-slate-700">{c.userName} <span className="text-[10px] text-slate-400 font-normal">in {c.groupName}</span></span>
+                            <span className="font-bold text-green-700">+{c.amount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}</span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Debtors Card (User Owes) */}
+                  <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center space-x-2">
+                        <div className="p-2 bg-red-50 text-red-600 rounded-lg">
+                          <ArrowDownRight className="w-4 h-4" strokeWidth={1.5} />
+                        </div>
+                        <div>
+                          <h4 className="font-bold text-sm text-slate-800">People You Owe</h4>
+                          <p className="text-[10px] text-slate-400">Total outstanding payables</p>
+                        </div>
+                      </div>
+                      <span className="font-extrabold text-base text-red-600">
+                        {globalBalances?.debtors?.reduce((sum: number, d: any) => sum + d.amount, 0).toLocaleString("en-IN", { style: "currency", currency: "INR" }) || "₹0.00"}
+                      </span>
+                    </div>
+
+                    <div className="space-y-2 max-h-[200px] overflow-y-auto pr-1">
+                      {!globalBalances || globalBalances.debtors?.length === 0 ? (
+                        <p className="text-xs text-slate-400 py-4 text-center">No outstanding payables.</p>
+                      ) : (
+                        globalBalances.debtors?.map((d: any, idx: number) => (
+                          <div key={idx} className="flex items-center justify-between p-2.5 bg-red-50/20 border border-red-100 rounded-lg text-xs">
+                            <span className="font-semibold text-slate-700">{d.userName} <span className="text-[10px] text-slate-400 font-normal">in {d.groupName}</span></span>
+                            <span className="font-bold text-red-700">-{d.amount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}</span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
             {/* Middle Section grid */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               
@@ -770,7 +1120,9 @@ export default function App() {
                   </div>
                 </div>
 
-                {groups.length === 0 ? (
+                {loadingGroups ? (
+                  <GroupSkeleton />
+                ) : groups.length === 0 ? (
                   <div className="flex-1 flex flex-col items-center justify-center p-12 text-slate-400">
                     <Users className="w-10 h-10 mb-2 stroke-1" />
                     <p className="text-xs">No sharing groups found.</p>
@@ -891,7 +1243,8 @@ export default function App() {
                 { key: "expenses", label: "Expenses" },
                 { key: "settlements", label: "Settlements" },
                 { key: "members", label: "Members" },
-                { key: "balances", label: "Balances" }
+                { key: "balances", label: "Balances" },
+                { key: "imports", label: "Imports" }
               ].map(tab => (
                 <button
                   key={tab.key}
@@ -1338,7 +1691,6 @@ export default function App() {
                 </div>
               </div>
             )}
-
             {/* TAB CONTENT: BALANCES & DEBT PLAN */}
             {groupTab === "balances" && (
               <div className="space-y-6">
@@ -1359,27 +1711,43 @@ export default function App() {
                             <div 
                               key={s.userId}
                               onClick={() => setTraceUser(s)}
-                              className="p-4 bg-white border border-slate-200 hover:border-blue-600 rounded-xl flex items-center justify-between transition-all cursor-pointer shadow-sm hover:shadow"
+                              className={`p-4 border rounded-xl flex items-center justify-between transition-all cursor-pointer shadow-sm hover:shadow ${
+                                isCreditor ? "bg-green-50/20 border-green-200 hover:border-green-400" :
+                                isDebtor ? "bg-red-50/20 border-red-200 hover:border-red-400" :
+                                "bg-slate-50 border-slate-200 hover:border-slate-350"
+                              }`}
                             >
                               <div className="flex items-center space-x-3">
-                                <div className="w-9 h-9 rounded-lg bg-slate-100 flex items-center justify-center font-bold text-blue-600 text-sm">
+                                <div className={`w-9 h-9 rounded-lg flex items-center justify-center font-bold text-sm ${
+                                  isCreditor ? "bg-green-100 text-green-800" :
+                                  isDebtor ? "bg-red-100 text-red-800" :
+                                  "bg-slate-200 text-slate-650"
+                                }`}>
                                   {s.userName[0]}
                                 </div>
                                 <div>
                                   <h4 className="font-bold text-sm text-slate-800">{s.userName}</h4>
-                                  <p className="text-[10px] text-slate-400">Click to audit balances</p>
+                                  <div className="flex items-center space-x-1.5 mt-0.5">
+                                    <span className="text-[10px] text-slate-400">Click to audit balances</span>
+                                    {isCreditor && <ArrowUpRight className="w-3 h-3 text-green-600" />}
+                                    {isDebtor && <ArrowDownRight className="w-3 h-3 text-red-650" />}
+                                  </div>
                                 </div>
                               </div>
                               <div className="text-right">
-                                <p className={`font-bold text-sm ${
+                                <p className={`font-extrabold text-sm ${
                                   isCreditor ? "text-green-600" :
-                                  isDebtor ? "text-red-600" :
-                                  "text-slate-450"
+                                  isDebtor ? "text-red-650" :
+                                  "text-slate-500"
                                 }`}>
                                   {isCreditor ? "+" : ""}{s.netBalance.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
                                 </p>
-                                <span className="text-[9px] text-slate-450 font-bold uppercase tracking-wider">
-                                  {isCreditor ? "Owed to them" : isDebtor ? "They owe" : "Settled"}
+                                <span className={`text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded ${
+                                  isCreditor ? "bg-green-100 text-green-800" :
+                                  isDebtor ? "bg-red-100 text-red-800" :
+                                  "bg-slate-100 text-slate-500"
+                                }`}>
+                                  {isCreditor ? "Gets back" : isDebtor ? "Owes" : "Settled"}
                                 </span>
                               </div>
                             </div>
@@ -1391,141 +1759,447 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* Debt minimization plans */}
+                  {/* Debt optimization plans */}
                   <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm h-fit">
-                    <h3 className="font-bold text-base text-slate-800 mb-4 flex items-center">
-                      <CheckCircle className="w-4 h-4 mr-2 text-green-600" /> Simplified Debt Plan
-                    </h3>
-
-                    {balances && balances.simplifiedDebts.length > 0 ? (
-                      <div className="space-y-3">
-                        {balances.simplifiedDebts.map((d, idx) => (
-                          <div key={idx} className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between text-xs">
-                            <div className="flex items-center space-x-2 text-slate-650">
-                              <span className="font-bold text-red-600">{d.fromUser}</span>
-                              <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
-                              <span className="font-bold text-green-600">{d.toUser}</span>
-                            </div>
-                            <span className="font-extrabold text-blue-700 bg-blue-50 border border-blue-100 px-2 py-0.5 rounded">
-                              {d.amount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
-                            </span>
-                          </div>
-                        ))}
+                    <div className="flex items-center justify-between mb-4">
+                      <h3 className="font-bold text-base text-slate-800 flex items-center">
+                        <CheckCircle className="w-4 h-4 mr-2 text-green-650" /> Simplified Debt Plan
+                      </h3>
+                      <div className="flex items-center space-x-1 bg-slate-100 p-0.5 rounded-lg">
+                        <button
+                          onClick={() => setShowOptimized(false)}
+                          className={`px-2 py-1 text-[10px] font-bold rounded-md transition-all ${
+                            !showOptimized 
+                              ? "bg-white text-slate-800 shadow-sm" 
+                              : "text-slate-500 hover:text-slate-800"
+                          }`}
+                        >
+                          Raw
+                        </button>
+                        <button
+                          onClick={() => setShowOptimized(true)}
+                          className={`px-2 py-1 text-[10px] font-bold rounded-md transition-all ${
+                            showOptimized 
+                              ? "bg-white text-slate-800 shadow-sm" 
+                              : "text-slate-500 hover:text-slate-800"
+                          }`}
+                        >
+                          Optimized
+                        </button>
                       </div>
-                    ) : (
-                      <p className="text-xs text-slate-400 py-4 text-center">No outstanding debts!</p>
+                    </div>
+
+                    {/* Transaction count reduction banner */}
+                    {showOptimized && balances && balances.simplifiedDebts.length < rawDebts.length && (
+                      <div className="mb-4 p-3 bg-blue-50 border border-blue-150 rounded-xl flex items-center space-x-2 text-[11px] text-blue-800">
+                        <Sparkles className="w-3.5 h-3.5 text-blue-650 flex-shrink-0 animate-pulse" />
+                        <div>
+                          Debt minimization saved <b>{rawDebts.length - balances.simplifiedDebts.length}</b> transactions! ({rawDebts.length} raw $\rightarrow$ {balances.simplifiedDebts.length} optimized)
+                        </div>
+                      </div>
                     )}
+
+                    {(() => {
+                      const debtsToRender = showOptimized 
+                        ? (balances?.simplifiedDebts || []) 
+                        : rawDebts;
+
+                      if (debtsToRender.length === 0) {
+                        return <p className="text-xs text-slate-400 py-6 text-center">No outstanding debts!</p>;
+                      }
+
+                      return (
+                        <div className="space-y-3">
+                          {debtsToRender.map((d, idx) => (
+                            <div key={idx} className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between text-xs">
+                              <div className="flex items-center space-x-2 text-slate-700">
+                                <span className="font-semibold text-red-655">{d.fromUser}</span>
+                                <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
+                                <span className="font-semibold text-green-600">{d.toUser}</span>
+                              </div>
+                              <span className="font-extrabold text-blue-750 bg-blue-50 border border-blue-100 px-2 py-0.5 rounded">
+                                {d.amount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    })()}
                   </div>
 
                 </div>
               </div>
             )}
 
+            {/* TAB CONTENT: IMPORTS */}
+            {groupTab === "imports" && (
+              <div className="space-y-6">
+                <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="font-bold text-base text-slate-800 flex items-center">
+                      <FileSpreadsheet className="w-4 h-4 mr-2 text-slate-500" /> Spreadsheet Reconciliation History
+                    </h3>
+                    <div className="text-xs text-slate-500">
+                      Total spreadsheets imported: {importJobs.filter(j => j.groupId === selectedGroupId).length}
+                    </div>
+                  </div>
+
+                  <div className="space-y-4">
+                    {importJobs.filter(j => j.groupId === selectedGroupId).length === 0 ? (
+                      <div className="text-center py-12 text-slate-400 space-y-2">
+                        <FileSpreadsheet className="w-10 h-10 mx-auto text-slate-300" />
+                        <p className="text-xs font-semibold">No spreadsheets reconciled for this group yet</p>
+                      </div>
+                    ) : (
+                      importJobs.filter(j => j.groupId === selectedGroupId).map(j => {
+                        const dateStr = new Date(j.uploadedAt).toLocaleString("en-IN", {
+                          day: "numeric",
+                          month: "short",
+                          year: "numeric",
+                          hour: "2-digit",
+                          minute: "2-digit"
+                        });
+                        return (
+                          <div key={j.id} className="p-4 bg-slate-50 border border-slate-200 rounded-xl flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                            <div className="space-y-1">
+                              <div className="flex items-center space-x-2">
+                                <span className="font-bold text-sm text-slate-800 truncate max-w-[250px]">{j.rawFileName}</span>
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                  j.status === "COMPLETED" ? "bg-green-100 text-green-800" :
+                                  j.status === "REVIEW_REQUIRED" ? "bg-amber-100 text-amber-800" :
+                                  "bg-slate-100 text-slate-655"
+                                }`}>
+                                  {j.status}
+                                </span>
+                              </div>
+                              <p className="text-xs text-slate-400">Imported on {dateStr}</p>
+                              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-650 pt-1">
+                                {j.summary && (
+                                  <>
+                                    <span>Rows: <b>{j.summary.rowsProcessed}</b></span>
+                                    <span>Expenses: <b>+{j.summary.expensesCreated}</b></span>
+                                    <span>Settlements: <b>+{j.summary.settlementsCreated}</b></span>
+                                  </>
+                                )}
+                                <span>Anomalies: <b>{j.anomaliesCount || 0}</b></span>
+                              </div>
+                            </div>
+                            <div className="flex items-center">
+                              <button
+                                onClick={async () => {
+                                  try {
+                                    const res = await api.get(`/imports/jobs/${j.id}`);
+                                    setSelectedImportJob(res.data);
+                                  } catch (err) {
+                                    showToast("Failed to fetch import job details", "error");
+                                  }
+                                }}
+                                className="w-full sm:w-auto bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-semibold px-4 py-2 rounded-lg text-xs cursor-pointer transition-colors shadow-sm text-center"
+                              >
+                                View Report Details
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
-
-        {/* VIEW: CSV IMPORT QUEUE (REVIEW WORKFLOW REDESIGN) */}
+                  {/* VIEW: CSV IMPORT QUEUE (REVIEW WORKFLOW REDESIGN) */}
         {view === "import" && selectedGroup && activeImportJobId && (
           <div className="space-y-6">
             
             <div className="flex items-center justify-between border-b border-slate-200 pb-4">
               <button 
-                onClick={() => { setView("group-detail"); setImportStats(null); }}
+                onClick={() => { setView("group-detail"); setImportStats(null); setImportStep(1); }}
                 className="text-slate-500 hover:text-slate-850 flex items-center text-sm font-semibold transition-colors cursor-pointer"
               >
                 <ArrowRight className="w-4 h-4 mr-1 rotate-180" /> Cancel and Back
               </button>
               <h2 className="text-lg font-bold text-slate-900 flex items-center">
-                <AlertTriangle className="w-5 h-5 text-amber-500 mr-2" /> Anomaly Resolution Queue
+                <FileSpreadsheet className="w-5 h-5 text-blue-600 mr-2" /> Spreadsheet Reconciliation Stepper
               </h2>
             </div>
 
-            {importStats ? (
-              /* Statistics Import report */
-              <div className="max-w-xl w-full mx-auto bg-white border border-slate-200 rounded-xl p-8 shadow-sm text-center space-y-6">
-                <CheckCircle className="w-12 h-12 text-green-600 mx-auto" />
+            {/* Guided Stepper Horizontal Progress Bar */}
+            <div className="flex items-center justify-between mb-8 max-w-3xl mx-auto border-b border-slate-100 pb-4">
+              {[
+                { step: 1, label: "Upload" },
+                { step: 2, label: "Parsing" },
+                { step: 3, label: "Detection" },
+                { step: 4, label: "Review" },
+                { step: 5, label: "Finalize" },
+                { step: 6, label: "Completed" }
+              ].map((s, idx, arr) => (
+                <React.Fragment key={s.step}>
+                  <div className="flex items-center space-x-2">
+                    <div className={`w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs transition-all ${
+                      importStep === s.step 
+                        ? "bg-blue-600 text-white shadow-sm ring-4 ring-blue-50" 
+                        : importStep > s.step 
+                          ? "bg-green-600 text-white" 
+                          : "bg-slate-100 text-slate-400"
+                    }`}>
+                      {importStep > s.step ? "✓" : s.step}
+                    </div>
+                    <span className={`text-xs font-semibold ${
+                      importStep === s.step ? "text-slate-800" : "text-slate-400"
+                    }`}>{s.label}</span>
+                  </div>
+                  {idx < arr.length - 1 && (
+                    <div className={`flex-1 h-0.5 mx-2 transition-all ${
+                      importStep > s.step ? "bg-green-500" : "bg-slate-200"
+                    }`}></div>
+                  )}
+                </React.Fragment>
+              ))}
+            </div>
+
+            {/* Stepper Loader View: Parsing */}
+            {importStep === 2 && (
+              <div className="text-center py-16 space-y-4 bg-white border border-slate-200 rounded-2xl max-w-md mx-auto shadow-sm">
+                <div className="animate-spin w-10 h-10 border-4 border-blue-600 border-t-transparent rounded-full mx-auto"></div>
+                <div>
+                  <h3 className="font-bold text-slate-800 text-base">Parsing CSV Spreadsheet...</h3>
+                  <p className="text-xs text-slate-400 mt-1">Reading raw row content and converting currency representations.</p>
+                </div>
+              </div>
+            )}
+
+            {/* Stepper Loader View: Detection */}
+            {importStep === 3 && (
+              <div className="text-center py-16 space-y-4 bg-white border border-slate-200 rounded-2xl max-w-md mx-auto shadow-sm">
+                <div className="animate-spin w-10 h-10 border-4 border-blue-600 border-t-transparent rounded-full mx-auto"></div>
+                <div>
+                  <h3 className="font-bold text-slate-800 text-base">Running Anomaly Engine...</h3>
+                  <p className="text-xs text-slate-400 mt-1">Scanning for duplicate rows, missing payers, and date ambiguities.</p>
+                </div>
+              </div>
+            )}
+
+            {/* Stepper Loader View: Finalizing */}
+            {importStep === 5 && (
+              <div className="text-center py-16 space-y-4 bg-white border border-slate-200 rounded-2xl max-w-md mx-auto shadow-sm">
+                <div className="animate-spin w-10 h-10 border-4 border-blue-600 border-t-transparent rounded-full mx-auto"></div>
+                <div>
+                  <h3 className="font-bold text-slate-800 text-base">Finalizing Reconciliation...</h3>
+                  <p className="text-xs text-slate-400 mt-1">Applying resolution mappings, writing ledger logs, and updating balances.</p>
+                </div>
+              </div>
+            )}
+
+            {/* Stepper Stage 6: Completed Summary Report */}
+            {importStep === 6 && importStats && (
+              <div className="max-w-xl w-full mx-auto bg-white border border-slate-200 rounded-2xl p-8 shadow-sm text-center space-y-6">
+                <div className="w-16 h-16 bg-green-50 text-green-600 rounded-full flex items-center justify-center mx-auto mb-2 border border-green-200">
+                  <CheckCircle className="w-8 h-8" />
+                </div>
                 <div>
                   <h3 className="text-xl font-bold text-slate-900">Import Completed Successfully</h3>
                   <p className="text-slate-500 text-xs mt-1">Audit resolve logs and new expenses logged in the group database.</p>
                 </div>
 
-                <div className="grid grid-cols-3 gap-3 p-4 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-650">
+                <div className="grid grid-cols-2 gap-4 p-4 bg-slate-50 border border-slate-200 rounded-xl text-left text-xs text-slate-650">
                   <div>
                     <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">Rows Processed</p>
                     <p className="font-extrabold text-slate-800 text-base">{importStats.rowsProcessed}</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] text-slate-450 font-bold uppercase mb-1">Elapsed Duration</p>
+                    <p className="font-extrabold text-slate-800 text-base">
+                      {importStartTime ? ((Date.now() - importStartTime) / 1000).toFixed(1) : "0.0"} seconds
+                    </p>
                   </div>
                   <div>
                     <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">Expenses Created</p>
                     <p className="font-extrabold text-green-600 text-base">+{importStats.expensesCreated}</p>
                   </div>
                   <div>
-                    <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">Settlements</p>
+                    <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">Settlements Logged</p>
                     <p className="font-extrabold text-blue-700 text-base">+{importStats.settlementsCreated}</p>
                   </div>
                 </div>
 
+                <div className="border border-slate-150 p-4 rounded-xl text-left text-xs bg-white space-y-2">
+                  <p className="font-bold text-slate-800">Mapped Entities Summary</p>
+                  <div className="space-y-1 text-slate-650">
+                    <p>• Group Context: <span className="font-semibold text-slate-800">{selectedGroup.name}</span></p>
+                    <p>• Resolved Anomalies: <span className="font-semibold text-slate-800">{Object.values(importResolutions).filter(r => r.resolutionAction !== null).length} items</span></p>
+                  </div>
+                </div>
+
                 <button 
-                  onClick={() => { setView("group-detail"); setImportStats(null); }}
-                  className="bg-blue-600 hover:bg-blue-700 text-white font-semibold px-6 py-2 rounded-lg cursor-pointer transition-all shadow-sm"
+                  onClick={() => { setView("group-detail"); setImportStats(null); setImportStep(1); }}
+                  className="bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs px-6 py-2.5 rounded-lg cursor-pointer transition-all shadow-sm"
                 >
                   View Group Balances
                 </button>
               </div>
-            ) : (
-              /* Review anomalies list */
+            )}
+
+            {/* Stepper Stage 4: Review Anomalies List */}
+            {importStep === 4 && (
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                 
                 {/* Resolution queue */}
                 <div className="lg:col-span-2 space-y-4">
                   
-                  {activeImportAnomalies.length === 0 ? (
-                    <div className="p-8 bg-white border border-slate-200 rounded-xl text-center space-y-2">
-                      <CheckCircle className="w-10 h-10 text-green-600 mx-auto" />
-                      <p className="font-semibold text-slate-800">CSV data is 100% clean!</p>
-                      <p className="text-xs text-slate-500">No anomalies detected. Proceed to finalize import.</p>
+                  {/* Bulk Actions controls */}
+                  <div className="flex flex-wrap gap-3 items-center justify-between bg-slate-50 border border-slate-200 p-4 rounded-xl">
+                    <div className="text-xs font-semibold text-slate-700">
+                      Bulk Queue Operations
                     </div>
-                  ) : (
-                    activeImportAnomalies.map(a => {
+                    <div className="flex space-x-3">
+                      <button 
+                        onClick={handleBulkIgnoreInfo}
+                        className="bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 text-xs px-3 py-1.5 font-semibold rounded-lg cursor-pointer transition-colors shadow-sm"
+                      >
+                        Ignore Info Alerts
+                      </button>
+                      <button 
+                        onClick={handleBulkAutoResolveSafe}
+                        className="bg-blue-600 hover:bg-blue-700 text-white text-xs px-3 py-1.5 font-semibold rounded-lg cursor-pointer transition-all shadow-sm"
+                      >
+                        Auto-Resolve Safe Warnings
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Severity tabs */}
+                  <div className="flex border-b border-slate-200 space-x-5 text-xs font-semibold">
+                    {(["ALL", "BLOCKING", "ERROR", "WARNING", "INFO"] as const).map(tab => {
+                      const count = tab === "ALL" 
+                        ? activeImportAnomalies.length 
+                        : activeImportAnomalies.filter(a => a.severity === tab).length;
+                      return (
+                        <button
+                          key={tab}
+                          onClick={() => setAnomalyTab(tab)}
+                          className={`pb-2 border-b-2 transition-all cursor-pointer ${
+                            anomalyTab === tab 
+                              ? "border-blue-600 text-blue-600" 
+                              : "border-transparent text-slate-400 hover:text-slate-700"
+                          }`}
+                        >
+                          {tab.charAt(0) + tab.slice(1).toLowerCase()} ({count})
+                        </button>
+                      );
+                    })}
+                  </div>
+                  
+                  {(() => {
+                    const filteredAnomalies = activeImportAnomalies.filter(a => {
+                      if (anomalyTab === "ALL") return true;
+                      return a.severity === anomalyTab;
+                    });
+
+                    if (filteredAnomalies.length === 0) {
+                      return (
+                        <div className="p-8 bg-white border border-slate-200 rounded-xl text-center space-y-3 shadow-sm">
+                          <div className="w-10 h-10 bg-green-50 text-green-600 rounded-full flex items-center justify-center mx-auto">
+                            <CheckCircle className="w-5 h-5" />
+                          </div>
+                          <h3 className="font-semibold text-slate-800 text-sm">No anomalies in this view</h3>
+                          <p className="text-xs text-slate-500">All scanned items are clean or resolved under this severity filter.</p>
+                        </div>
+                      );
+                    }
+
+                    return filteredAnomalies.map(a => {
                       const resolution = importResolutions[a.fingerprint];
                       const isResolved = resolution && resolution.resolutionAction !== null;
 
                       return (
                         <div 
                           key={a.id}
-                          className={`p-5 bg-white border rounded-xl shadow-sm transition-all ${
-                            isResolved ? "border-green-500 bg-green-50/10" :
+                          className={`p-5 bg-white border rounded-xl shadow-sm transition-all space-y-4 ${
+                            isResolved ? "border-green-500 bg-green-50/5" :
                             a.severity === "BLOCKING" ? "border-red-400" :
                             a.severity === "ERROR" ? "border-amber-400" :
                             "border-slate-200"
                           }`}
                         >
-                          <div className="flex items-center justify-between mb-3 text-xs">
+                          <div className="flex items-center justify-between text-xs">
                             <span className="font-bold text-slate-400">Row {a.rowNumber} • {a.anomalyType}</span>
                             <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
                               a.severity === "BLOCKING" ? "bg-red-100 text-red-800" :
                               a.severity === "ERROR" ? "bg-amber-100 text-amber-800" :
                               a.severity === "WARNING" ? "bg-yellow-100 text-yellow-800" :
-                              "bg-slate-100 text-slate-600"
+                              "bg-slate-100 text-slate-650"
                             }`}>
                               {a.severity}
                             </span>
                           </div>
 
-                          <h4 className="font-bold text-sm text-slate-800 mb-3">{a.description}</h4>
+                          <div>
+                            <h4 className="font-bold text-sm text-slate-800">{a.description}</h4>
+                            <p className="text-xs text-slate-500 mt-1">Pluggable rule: {a.fingerprint.split("_").slice(0, 3).join(" ")}</p>
+                          </div>
 
-                          {/* Raw Csv Preview */}
-                          <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-500 space-y-1 mb-3">
-                            <p className="text-[10px] font-bold text-slate-400 uppercase">CSV raw row details</p>
-                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                              <div>Date: <b>{a.rawRow.date}</b></div>
-                              <div>Desc: <b>{a.rawRow.description}</b></div>
-                              <div>Payer: <b>{a.rawRow.paid_by || "(empty)"}</b></div>
-                              <div>Amt: <b>{a.rawRow.amount} {a.rawRow.currency}</b></div>
+                          {/* Side-by-side Before/After Diff Block */}
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 p-3 bg-slate-50 border border-slate-200 rounded-xl text-[11px]">
+                            {/* Before (Original CSV) */}
+                            <div className="space-y-1 sm:border-r border-slate-200 sm:pr-2">
+                              <p className="font-bold text-[9px] uppercase text-slate-400 mb-1.5 flex items-center">
+                                <span className="w-1.5 h-1.5 rounded-full bg-red-400 mr-1.5"></span> Original Row Content
+                              </p>
+                              <div className="truncate text-slate-600"><b>Date:</b> {a.rawRow.date || "-"}</div>
+                              <div className="truncate text-slate-600"><b>Description:</b> {a.rawRow.description || "-"}</div>
+                              <div className="truncate text-slate-600"><b>Paid By:</b> {a.rawRow.paid_by || "-"}</div>
+                              <div className="truncate text-slate-600"><b>Amount:</b> {a.rawRow.amount} {a.rawRow.currency || ""}</div>
+                            </div>
+
+                            {/* After (Resolved Output) */}
+                            <div className="space-y-1 sm:pl-2">
+                              <p className="font-bold text-[9px] uppercase text-slate-400 mb-1.5 flex items-center">
+                                <span className="w-1.5 h-1.5 rounded-full bg-green-500 mr-1.5"></span> Adjusted Output Ledger
+                              </p>
+                              {(() => {
+                                const res = importResolutions[a.fingerprint];
+                                const isExcluded = res?.resolutionAction === "REJECT_ROW";
+                                const isSettlement = res?.resolutionAction === "CONVERTED_TO_SETTLEMENT";
+                                
+                                if (isExcluded) {
+                                  return <div className="text-red-650 font-semibold italic py-2">Row Excluded (will not be imported)</div>;
+                                }
+
+                                let finalDate = a.rawRow.date;
+                                if (res?.resolutionDetails?.selectedDate) {
+                                  finalDate = new Date(res.resolutionDetails.selectedDate).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+                                }
+
+                                let finalPaidBy = a.rawRow.paid_by;
+                                if (res?.resolutionAction === "MAPPED_USER" && res?.resolutionDetails?.to) {
+                                  finalPaidBy = res.resolutionDetails.to;
+                                }
+
+                                return (
+                                  <>
+                                    <div className={`truncate ${res?.resolutionDetails?.selectedDate ? "text-green-600 font-semibold" : "text-slate-600"}`}>
+                                      <b>Date:</b> {finalDate}
+                                    </div>
+                                    <div className="truncate text-slate-600"><b>Description:</b> {a.rawRow.description || "-"}</div>
+                                    <div className={`truncate ${res?.resolutionAction === "MAPPED_USER" ? "text-green-600 font-semibold" : "text-slate-600"}`}>
+                                      <b>Paid By:</b> {finalPaidBy}
+                                    </div>
+                                    <div className={`truncate ${isSettlement ? "text-blue-650 font-semibold" : "text-slate-600"}`}>
+                                      <b>Type:</b> {isSettlement ? "Settlement" : "Expense"}
+                                    </div>
+                                    <div className="truncate text-slate-600">
+                                      <b>Amount:</b> {a.rawRow.amount} {a.rawRow.currency || "INR"}
+                                    </div>
+                                  </>
+                                );
+                              })()}
                             </div>
                           </div>
 
                           {/* Interactive Resolution Panel */}
-                          <div className="flex flex-wrap gap-2 text-xs">
+                          <div className="flex flex-wrap gap-2 text-xs border-t border-slate-100 pt-3">
                             {/* Missing Payer */}
                             {a.anomalyType === "MISSING_PAYER" && (
                               <div className="space-y-2 w-full">
@@ -1554,8 +2228,9 @@ export default function App() {
                                 <p className="text-[10px] text-slate-500 font-bold uppercase">Map to Existing member:</p>
                                 <div className="flex flex-wrap gap-2">
                                   {selectedGroup.memberships.map(m => {
-                                    const match = a.description.match(/'(.+?)'/);
-                                    const rawName = match ? match[1] : "";
+                                    // Robust name resolver that matches text correctly without breaking on special chars
+                                    const match = a.description.match(/Unknown user '(.+)' detected/);
+                                    const rawName = match ? match[1] : a.rawRow.paid_by || "";
                                     return (
                                       <button
                                         key={m.id}
@@ -1578,7 +2253,7 @@ export default function App() {
                             {a.anomalyType === "AMBIGUOUS_DATE" && (
                               <div className="space-y-2 w-full">
                                 <p className="text-[10px] text-slate-500 font-bold uppercase">Confirm Date interpretation:</p>
-                                <div className="flex space-x-3">
+                                <div className="flex flex-wrap gap-2">
                                   {(() => {
                                     const match = a.rawRow.date.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
                                     if (!match) return null;
@@ -1592,7 +2267,7 @@ export default function App() {
                                       <>
                                         <button 
                                           onClick={() => handleResolveAnomaly(a.fingerprint, "ACCEPTED_WARNING", { selectedDate: d1 })}
-                                          className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
+                                          className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
                                             resolution?.resolutionDetails?.selectedDate === d1
                                               ? "bg-blue-600 border-blue-500 text-white"
                                               : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
@@ -1602,7 +2277,7 @@ export default function App() {
                                         </button>
                                         <button 
                                           onClick={() => handleResolveAnomaly(a.fingerprint, "ACCEPTED_WARNING", { selectedDate: d2 })}
-                                          className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
+                                          className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
                                             resolution?.resolutionDetails?.selectedDate === d2
                                               ? "bg-blue-600 border-blue-500 text-white"
                                               : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
@@ -1619,10 +2294,10 @@ export default function App() {
 
                             {/* Repayment Disguised */}
                             {a.anomalyType === "SETTLEMENT_DISGUISED_AS_EXPENSE" && (
-                              <>
+                              <div className="flex space-x-2">
                                 <button 
                                   onClick={() => handleResolveAnomaly(a.fingerprint, "CONVERTED_TO_SETTLEMENT")}
-                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
+                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
                                     resolution?.resolutionAction === "CONVERTED_TO_SETTLEMENT"
                                       ? "bg-blue-600 border-blue-550 text-white"
                                       : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
@@ -1632,7 +2307,7 @@ export default function App() {
                                 </button>
                                 <button 
                                   onClick={() => handleResolveAnomaly(a.fingerprint, "ACCEPTED_WARNING")}
-                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
+                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
                                     resolution?.resolutionAction === "ACCEPTED_WARNING"
                                       ? "bg-slate-200 border-slate-300 text-slate-800"
                                       : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
@@ -1640,17 +2315,17 @@ export default function App() {
                                 >
                                   Keep as regular Expense
                                 </button>
-                              </>
+                              </div>
                             )}
 
                             {/* Duplicate checking */}
                             {a.anomalyType === "DUPLICATE" && (
-                              <>
+                              <div className="flex space-x-2">
                                 <button 
                                   onClick={() => handleResolveAnomaly(a.fingerprint, "REJECT_ROW")}
-                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
+                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
                                     resolution?.resolutionAction === "REJECT_ROW"
-                                      ? "bg-red-600 border-red-500 text-white"
+                                      ? "bg-red-650 border-red-500 text-white"
                                       : "bg-white border-slate-300 hover:bg-slate-50 text-red-650"
                                   }`}
                                 >
@@ -1658,7 +2333,7 @@ export default function App() {
                                 </button>
                                 <button 
                                   onClick={() => handleResolveAnomaly(a.fingerprint, "APPROVED_DUPLICATE")}
-                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
+                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
                                     resolution?.resolutionAction === "APPROVED_DUPLICATE"
                                       ? "bg-green-600 border-green-500 text-white"
                                       : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
@@ -1666,15 +2341,15 @@ export default function App() {
                                 >
                                   Approve Duplicate
                                 </button>
-                              </>
+                              </div>
                             )}
 
-                            {/* Safe Warns */}
+                            {/* Safe Warnings */}
                             {["MISSING_CURRENCY", "NEGATIVE_AMOUNT", "ZERO_AMOUNT", "MEMBERSHIP_VIOLATION"].includes(a.anomalyType) && (
-                              <>
+                              <div className="flex space-x-2">
                                 <button 
                                   onClick={() => handleResolveAnomaly(a.fingerprint, "ACCEPTED_WARNING")}
-                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
+                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
                                     resolution?.resolutionAction === "ACCEPTED_WARNING"
                                       ? "bg-blue-600 border-blue-500 text-white"
                                       : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
@@ -1685,16 +2360,30 @@ export default function App() {
                                 {a.anomalyType === "MEMBERSHIP_VIOLATION" && (
                                   <button 
                                     onClick={() => handleResolveAnomaly(a.fingerprint, "REJECT_ROW")}
-                                    className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
+                                    className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
                                       resolution?.resolutionAction === "REJECT_ROW"
-                                        ? "bg-red-600 border-red-500 text-white"
+                                        ? "bg-red-650 border-red-500 text-white"
                                         : "bg-white border-slate-300 hover:bg-slate-50 text-red-650"
                                     }`}
                                   >
                                     Exclude Row
                                   </button>
                                 )}
-                              </>
+                              </div>
+                            )}
+
+                            {/* Manual Exclude Button for other types */}
+                            {!["DUPLICATE", "MEMBERSHIP_VIOLATION"].includes(a.anomalyType) && (
+                              <button
+                                onClick={() => handleResolveAnomaly(a.fingerprint, "REJECT_ROW")}
+                                className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
+                                  resolution?.resolutionAction === "REJECT_ROW"
+                                    ? "bg-red-650 border-red-500 text-white"
+                                    : "bg-white border-slate-300 hover:bg-red-50 hover:text-red-600 text-slate-600 ml-auto"
+                                }`}
+                              >
+                                Exclude Row
+                              </button>
                             )}
 
                           </div>
@@ -1712,15 +2401,15 @@ export default function App() {
 
                         </div>
                       );
-                    })
-                  )}
+                    });
+                  })()}
                 </div>
 
                 {/* Right Column: Diagnostics panel and Final controls */}
                 <div className="space-y-6">
                   {/* Final control */}
                   <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm space-y-4">
-                    <h3 className="font-bold text-base text-slate-800">Import Controller</h3>
+                    <h3 className="font-bold text-base text-slate-800">Reconciliation Controls</h3>
                     <div className="text-xs text-slate-500 space-y-2">
                       <div className="flex justify-between">
                         <span>Total anomalies:</span>
@@ -1735,29 +2424,44 @@ export default function App() {
                     </div>
                     <button 
                       onClick={handleFinalizeImport}
-                      className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 rounded-lg cursor-pointer text-xs"
+                      className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 rounded-lg cursor-pointer text-xs transition-colors shadow-sm"
                     >
                       Persist Resolved Data & Generate Report
                     </button>
                   </div>
 
-                  {/* Diagnostics Panel */}
-                  <div className="bg-slate-950 text-slate-200 rounded-xl p-5 shadow-sm space-y-3 font-mono text-[10px]">
-                    <h4 className="font-bold border-b border-slate-800 pb-2 text-slate-400 flex items-center">
-                      <Database className="w-3.5 h-3.5 mr-1" /> Import Diagnostics
+                  {/* Diagnostics Panel (Human Readable Format) */}
+                  <div className="bg-slate-950 text-slate-200 rounded-xl p-5 shadow-sm space-y-4 font-mono text-[10px]">
+                    <h4 className="font-bold border-b border-slate-855 pb-2 text-slate-400 flex items-center">
+                      <Database className="w-3.5 h-3.5 mr-1" /> Pipeline Diagnostics
                     </h4>
                     <div className="space-y-3 max-h-[300px] overflow-y-auto pr-1">
                       {diagnosticsLogs.length === 0 ? (
                         <p className="text-slate-500">Awaiting import pipeline start...</p>
                       ) : (
-                        diagnosticsLogs.map((log, idx) => (
-                          <div key={idx} className="space-y-1">
-                            <p className="text-blue-400">[{log.timestamp}] STAGE: {log.stage}</p>
-                            <pre className="text-slate-400 overflow-x-auto bg-slate-900/50 p-2 rounded max-w-[250px]">
-                              {JSON.stringify(log.details, null, 2)}
-                            </pre>
-                          </div>
-                        ))
+                        diagnosticsLogs.map((log, idx) => {
+                          const keys = Object.keys(log.details || {});
+                          return (
+                            <div key={idx} className="space-y-1 border-b border-slate-850 pb-2">
+                              <div className="flex items-center justify-between text-blue-400">
+                                <span>[{log.timestamp}] STAGE: {log.stage}</span>
+                              </div>
+                              <div className="text-slate-400 pl-2 space-y-0.5">
+                                {keys.map(k => {
+                                  const val = log.details[k];
+                                  const displayVal = typeof val === "object" && val !== null
+                                    ? Array.isArray(val) ? `[${val.length} items]` : "{details}"
+                                    : String(val);
+                                  return (
+                                    <div key={k}>
+                                      • {k}: <b className="text-slate-300">{displayVal}</b>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          );
+                        })
                       )}
                     </div>
                   </div>
@@ -1951,6 +2655,83 @@ export default function App() {
               }`}>
                 {traceUser.netBalance > 0 ? "+" : ""}{traceUser.netBalance.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
               </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Past spreadsheet import detail report */}
+      {selectedImportJob && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+          <div className="bg-white border border-slate-200 rounded-2xl max-w-2xl w-full p-6 shadow-2xl flex flex-col max-h-[85vh]">
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3 mb-4">
+              <div>
+                <h3 className="font-bold text-base text-slate-900">Import Reconciliation Report</h3>
+                <p className="text-[10px] text-slate-500">Job: {selectedImportJob.id}</p>
+              </div>
+              <button 
+                onClick={() => setSelectedImportJob(null)}
+                className="text-xs font-semibold px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg cursor-pointer transition-colors"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto space-y-4 pr-1">
+              <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-2 text-xs">
+                <div className="grid grid-cols-2 gap-2 text-slate-650">
+                  <div>File name: <b className="text-slate-800">{selectedImportJob.rawFileName}</b></div>
+                  <div>Status: <b className="text-slate-800">{selectedImportJob.status}</b></div>
+                  <div>Imported: <b className="text-slate-800">{new Date(selectedImportJob.uploadedAt).toLocaleString()}</b></div>
+                  <div>Hash: <b className="text-slate-450 font-mono text-[10px]">{selectedImportJob.rawFileHash.substring(0, 16)}...</b></div>
+                </div>
+
+                {selectedImportJob.summary && (
+                  <div className="grid grid-cols-3 gap-2 border-t border-slate-200 pt-2 mt-2 text-center text-slate-650">
+                    <div>
+                      <p className="text-[9px] text-slate-450 uppercase font-bold">Rows</p>
+                      <p className="font-extrabold text-slate-700">{selectedImportJob.summary.rowsProcessed}</p>
+                    </div>
+                    <div>
+                      <p className="text-[9px] text-slate-450 uppercase font-bold">Expenses</p>
+                      <p className="font-extrabold text-green-600">+{selectedImportJob.summary.expensesCreated}</p>
+                    </div>
+                    <div>
+                      <p className="text-[9px] text-slate-450 uppercase font-bold">Settlements</p>
+                      <p className="font-extrabold text-blue-700">+{selectedImportJob.summary.settlementsCreated}</p>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Anomalies Audits */}
+              <div className="space-y-3">
+                <h4 className="font-bold text-xs text-slate-700 uppercase tracking-wider">resolved anomalies log ({selectedImportJob.anomalies?.length || 0})</h4>
+                {selectedImportJob.anomalies && selectedImportJob.anomalies.length > 0 ? (
+                  <div className="space-y-2">
+                    {selectedImportJob.anomalies.map((a: any) => (
+                      <div key={a.id} className="p-3 bg-white border border-slate-200 rounded-xl text-xs space-y-2">
+                        <div className="flex justify-between items-center text-[10px]">
+                          <span className="font-bold text-slate-400">Row {a.rowNumber} • {a.anomalyType}</span>
+                          <span className="px-2 py-0.5 rounded font-bold bg-green-50 text-green-700 border border-green-200">
+                            {a.status}
+                          </span>
+                        </div>
+                        <p className="font-semibold text-slate-800">{a.description}</p>
+                        
+                        {a.resolutionAction && (
+                          <div className="p-2 bg-slate-50 border border-slate-100 rounded-lg space-y-1 text-[11px]">
+                            <div>Action: <b className="text-blue-700 font-semibold">{a.resolutionAction}</b></div>
+                            {a.resolutionNote && <div>Note: <span className="text-slate-600">{a.resolutionNote}</span></div>}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-xs text-slate-450 italic">No anomalies were detected during import.</p>
+                )}
+              </div>
             </div>
           </div>
         </div>
