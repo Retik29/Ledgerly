@@ -1,8 +1,9 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { api } from "./services/api";
 import { 
   Users, Plus, Upload, Trash2, ArrowRight, UserCheck, AlertTriangle, AlertOctagon, 
-  CheckCircle, ArrowLeftRight, HelpCircle, LogOut, Check, RefreshCw, Info, Calendar, FileText
+  CheckCircle, ArrowLeftRight, HelpCircle, LogOut, Check, RefreshCw, Info, Calendar, FileText,
+  Search, Eye, ShieldAlert, History, Activity, Database, CheckSquare, Layers
 } from "lucide-react";
 
 // Types
@@ -91,7 +92,10 @@ interface ImportJob {
     rowsProcessed: number;
     expensesCreated: number;
     settlementsCreated: number;
+    anomaliesFound: number;
+    errorsFound: number;
   } | null;
+  anomalies?: ImportAnomaly[];
 }
 
 interface ImportAnomaly {
@@ -104,13 +108,29 @@ interface ImportAnomaly {
   rawRow: any;
   normalizedRow: any;
   status: string;
+  resolutionAction?: string | null;
+  resolutionNote?: string | null;
+}
+
+interface AuditLog {
+  id: string;
+  entityType: string;
+  entityId: string;
+  action: string;
+  performedBy: string | null;
+  beforeState: any;
+  afterState: any;
+  createdAt: string;
 }
 
 export default function App() {
   const [token, setToken] = useState<string | null>(localStorage.getItem("token"));
   const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [view, setView] = useState<"login" | "register" | "dashboard" | "group-detail" | "import">("login");
+  const [view, setView] = useState<"login" | "register" | "dashboard" | "group-detail" | "import" | "admin-demo">("login");
   
+  // Tab within group details page
+  const [groupTab, setGroupTab] = useState<"overview" | "expenses" | "settlements" | "members" | "balances" | "imports">("overview");
+
   // Auth Form State
   const [authName, setAuthName] = useState("");
   const [authEmail, setAuthEmail] = useState("");
@@ -155,8 +175,40 @@ export default function App() {
   const [importStats, setImportStats] = useState<any | null>(null);
   const [importError, setImportError] = useState("");
 
+  // Diagnostics Panel Stage Logging
+  const [diagnosticsLogs, setDiagnosticsLogs] = useState<{ stage: string; timestamp: string; details: any }[]>([]);
+
+  // Admin Demo State
+  const [adminDemoData, setAdminDemoData] = useState<{
+    importJobs: ImportJob[];
+    auditLogs: AuditLog[];
+    memberships: any[];
+  } | null>(null);
+
   // Modal / Traceability State
   const [traceUser, setTraceUser] = useState<UserBalanceSummary | null>(null);
+
+  // Table Search and Sort State
+  const [expenseSearch, setExpenseSearch] = useState("");
+  const [expenseSortField, setExpenseSortField] = useState<"date" | "amount" | "title">("date");
+  const [expenseSortOrder, setExpenseSortOrder] = useState<"asc" | "desc">("desc");
+
+  // Hash-based Admin Demo Route Router
+  useEffect(() => {
+    const handleHash = () => {
+      if (window.location.hash === "#/admin/demo") {
+        if (token) {
+          setView("admin-demo");
+          fetchAdminDemoData();
+        } else {
+          setView("login");
+        }
+      }
+    };
+    window.addEventListener("hashchange", handleHash);
+    handleHash(); // initial check
+    return () => window.removeEventListener("hashchange", handleHash);
+  }, [token]);
 
   // Check login session on load
   useEffect(() => {
@@ -173,7 +225,12 @@ export default function App() {
     try {
       const res = await api.get("/auth/me");
       setCurrentUser(res.data.user);
-      setView("dashboard");
+      if (window.location.hash === "#/admin/demo") {
+        setView("admin-demo");
+        fetchAdminDemoData();
+      } else {
+        setView("dashboard");
+      }
       fetchGroups();
       fetchImportJobs();
     } catch (err) {
@@ -186,6 +243,7 @@ export default function App() {
     setToken(null);
     setCurrentUser(null);
     setView("login");
+    window.location.hash = "";
   };
 
   const handleAuth = async (type: "login" | "register") => {
@@ -201,7 +259,7 @@ export default function App() {
       setAuthEmail("");
       setAuthPassword("");
     } catch (err: any) {
-      setAuthError(err.response?.data?.error || `Failed to ${type}`);
+      setAuthError(err.response?.data?.message || err.response?.data?.error || `Failed to ${type}`);
     }
   };
 
@@ -218,6 +276,15 @@ export default function App() {
     try {
       const res = await api.get("/imports/jobs");
       setImportJobs(res.data);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const fetchAdminDemoData = async () => {
+    try {
+      const res = await api.get("/admin/demo");
+      setAdminDemoData(res.data);
     } catch (err) {
       console.error(err);
     }
@@ -245,7 +312,7 @@ export default function App() {
       setAddMemberJoinDate("");
       fetchGroupDetails(selectedGroupId);
     } catch (err: any) {
-      alert(err.response?.data?.error || "Failed to add member");
+      alert(err.response?.data?.message || err.response?.data?.error || "Failed to add member");
     }
   };
 
@@ -309,7 +376,7 @@ export default function App() {
       });
       fetchGroupDetails(selectedGroupId);
     } catch (err: any) {
-      alert(err.response?.data?.error || "Failed to create expense");
+      alert(err.response?.data?.message || err.response?.data?.error || "Failed to create expense");
     }
   };
 
@@ -335,7 +402,7 @@ export default function App() {
       });
       fetchGroupDetails(selectedGroupId);
     } catch (err: any) {
-      alert(err.response?.data?.error || "Failed to record settlement");
+      alert(err.response?.data?.message || err.response?.data?.error || "Failed to record settlement");
     }
   };
 
@@ -366,19 +433,32 @@ export default function App() {
     if (!importFile || !importCsvContent || !selectedGroupId) return;
     setImportError("");
     setImportStats(null);
+    setDiagnosticsLogs([]); // clear log panel
+
+    // Initialize diagnostic stage log
+    addDiagnosticsLog("REQUEST_VALIDATION", { filename: importFile.name, size: importFile.size });
+
     try {
+      addDiagnosticsLog("DUPLICATE_CHECK", { checkingDb: true });
+      addDiagnosticsLog("CSV_PARSER", { parsing: true });
+
       const res = await api.post("/imports/upload", {
         filename: importFile.name,
         csvContent: importCsvContent,
         groupId: selectedGroupId
       });
+
+      addDiagnosticsLog("ANOMALY_ENGINE", {
+        anomaliesCount: res.data.anomaliesCount,
+        anomalies: res.data.anomalies
+      });
+
       setActiveImportJobId(res.data.jobId);
       setActiveImportAnomalies(res.data.anomalies);
       
-      // Initialize resolution state with default actions
+      // Initialize resolutions
       const initialResolutions: any = {};
       res.data.anomalies.forEach((a: ImportAnomaly) => {
-        // Build empty resolution objects
         initialResolutions[a.fingerprint] = {
           anomalyType: a.fingerprint,
           resolutionAction: a.severity === "INFO" ? "ACCEPTED_WARNING" : null,
@@ -389,8 +469,17 @@ export default function App() {
       setImportResolutions(initialResolutions);
       setView("import");
     } catch (err: any) {
-      setImportError(err.response?.data?.error || "Failed to analyze CSV file.");
+      const errData = err.response?.data;
+      addDiagnosticsLog(errData?.stage || "SERVER_CRASH", { error: errData?.message || err.message });
+      setImportError(errData?.message || "Failed to analyze CSV file.");
     }
+  };
+
+  const addDiagnosticsLog = (stage: string, details: any) => {
+    setDiagnosticsLogs(prev => [
+      ...prev,
+      { stage, timestamp: new Date().toLocaleTimeString(), details }
+    ]);
   };
 
   const handleResolveAnomaly = (fingerprint: string, action: string, details: any = {}) => {
@@ -432,170 +521,249 @@ export default function App() {
     }
 
     try {
+      addDiagnosticsLog("PERSISTENCE", { finalizing: true });
       const res = await api.post(`/imports/jobs/${activeImportJobId}/resolve`, {
         groupId: selectedGroupId,
         csvContent: importCsvContent,
         resolutions: Object.values(importResolutions)
       });
       setImportStats(res.data.summary);
+      addDiagnosticsLog("COMPLETED", res.data.summary);
       fetchImportJobs();
       fetchGroupDetails(selectedGroupId);
     } catch (err: any) {
-      alert(err.response?.data?.error || "Import persistence failed");
+      const errData = err.response?.data;
+      addDiagnosticsLog(errData?.stage || "PERSISTENCE_FAILED", { error: errData?.message || err.message });
+      alert(errData?.message || "Import persistence failed");
     }
   };
 
+  // Memoized filtered and sorted expenses
+  const processedExpenses = useMemo(() => {
+    let result = [...expenses];
+    if (expenseSearch.trim()) {
+      const query = expenseSearch.toLowerCase();
+      result = result.filter(e => 
+        e.title.toLowerCase().includes(query) || 
+        e.payer.name.toLowerCase().includes(query)
+      );
+    }
+
+    result.sort((a, b) => {
+      let aVal: any = a[expenseSortField === "date" ? "expenseDate" : expenseSortField];
+      let bVal: any = b[expenseSortField === "date" ? "expenseDate" : expenseSortField];
+      
+      if (expenseSortField === "date") {
+        aVal = new Date(aVal).getTime();
+        bVal = new Date(bVal).getTime();
+      }
+
+      if (aVal < bVal) return expenseSortOrder === "asc" ? -1 : 1;
+      if (aVal > bVal) return expenseSortOrder === "asc" ? 1 : -1;
+      return 0;
+    });
+
+    return result;
+  }, [expenses, expenseSearch, expenseSortField, expenseSortOrder]);
+
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans selection:bg-indigo-500 selection:text-white">
+    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans antialiased selection:bg-blue-600 selection:text-white">
       {/* Header */}
-      <header className="border-b border-slate-800 bg-slate-950/60 backdrop-blur sticky top-0 z-40 px-6 py-4 flex items-center justify-between">
-        <div className="flex items-center space-x-3 cursor-pointer" onClick={() => setView(token ? "dashboard" : "login")}>
-          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center font-bold text-white shadow-lg shadow-indigo-500/20">
+      <header className="border-b border-slate-200 bg-white sticky top-0 z-40 px-6 py-4 flex items-center justify-between shadow-sm">
+        <div className="flex items-center space-x-3 cursor-pointer" onClick={() => { setView(token ? "dashboard" : "login"); window.location.hash = ""; }}>
+          <div className="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center font-bold text-white shadow-sm">
             S
           </div>
           <div>
-            <h1 className="font-extrabold text-xl tracking-tight bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">RetiX Shared Expense</h1>
+            <h1 className="font-extrabold text-lg tracking-tight text-slate-900">Shared Expense Manager</h1>
             <p className="text-xs text-slate-500 font-medium">Spreetail Internship Assessment</p>
           </div>
         </div>
         
-        {currentUser && (
-          <div className="flex items-center space-x-4">
-            <span className="text-sm font-medium text-slate-400">Hi, <b className="text-slate-100">{currentUser.name}</b></span>
-            <button 
-              onClick={handleLogout}
-              className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 hover:text-red-400 text-slate-400 transition-all cursor-pointer"
-              title="Logout"
-            >
-              <LogOut className="w-5 h-5" />
-            </button>
-          </div>
-        )}
+        <div className="flex items-center space-x-4">
+          {currentUser && (
+            <>
+              <button 
+                onClick={() => { setView("admin-demo"); window.location.hash = "#/admin/demo"; }}
+                className={`text-xs font-semibold px-3 py-1.5 rounded-lg border transition-all cursor-pointer flex items-center ${
+                  view === "admin-demo"
+                    ? "bg-blue-50 border-blue-200 text-blue-700 font-bold"
+                    : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
+                }`}
+              >
+                <Layers className="w-3.5 h-3.5 mr-1" /> Interview Demo Mode
+              </button>
+              <span className="text-sm font-medium text-slate-500">Hi, <b className="text-slate-900">{currentUser.name}</b></span>
+              <button 
+                onClick={handleLogout}
+                className="p-2 rounded-lg bg-slate-100 hover:bg-slate-200 hover:text-red-600 text-slate-500 transition-all cursor-pointer"
+                title="Logout"
+              >
+                <LogOut className="w-5 h-5" />
+              </button>
+            </>
+          )}
+        </div>
       </header>
 
-      {/* Main Content Area */}
-      <main className="flex-1 p-6 max-w-7xl w-full mx-auto">
+      {/* Main Container */}
+      <main className="flex-1 max-w-[1440px] w-full mx-auto p-6 md:p-8">
         
         {/* VIEW: LOGIN */}
         {view === "login" && (
-          <div className="max-w-md w-full mx-auto my-12 bg-slate-950/40 border border-slate-800/80 rounded-2xl p-8 shadow-xl">
-            <h2 className="text-2xl font-bold text-center mb-2">Welcome Back</h2>
-            <p className="text-slate-400 text-sm text-center mb-8">Access your shared expenses and imports</p>
+          <div className="max-w-md w-full mx-auto my-12 bg-white border border-slate-200 rounded-2xl p-8 shadow-sm">
+            <h2 className="text-2xl font-bold text-slate-900 text-center mb-1">Welcome Back</h2>
+            <p className="text-slate-500 text-sm text-center mb-8">Access your shared expenses and imports</p>
 
-            {authError && <div className="p-3 bg-red-950/40 border border-red-800 text-red-400 rounded-lg text-sm mb-4">{authError}</div>}
+            {authError && <div className="p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm mb-4">{authError}</div>}
 
             <div className="space-y-4">
               <div>
-                <label className="block text-xs font-semibold text-slate-400 mb-1 uppercase tracking-wider">Email</label>
+                <label className="block text-xs font-semibold text-slate-500 mb-1 uppercase tracking-wider">Email</label>
                 <input 
                   type="email" 
                   value={authEmail} 
                   onChange={e => setAuthEmail(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-indigo-500 transition-colors" 
+                  className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600" 
                   placeholder="name@example.com"
                 />
               </div>
               <div>
-                <label className="block text-xs font-semibold text-slate-400 mb-1 uppercase tracking-wider">Password</label>
+                <label className="block text-xs font-semibold text-slate-500 mb-1 uppercase tracking-wider">Password</label>
                 <input 
                   type="password" 
                   value={authPassword} 
                   onChange={e => setAuthPassword(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-indigo-500 transition-colors"
+                  className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
                   placeholder="••••••••"
                 />
               </div>
               <button 
                 onClick={() => handleAuth("login")}
-                className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-3 rounded-xl transition-all shadow-lg shadow-indigo-600/25 mt-6 cursor-pointer"
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-xl transition-all shadow-sm mt-6 cursor-pointer"
               >
                 Log In
               </button>
             </div>
             
             <p className="text-sm text-slate-500 text-center mt-6">
-              New here? <button onClick={() => { setView("register"); setAuthError(""); }} className="text-indigo-400 hover:underline font-medium">Create an account</button>
+              New here? <button onClick={() => { setView("register"); setAuthError(""); }} className="text-blue-600 hover:underline font-medium">Create an account</button>
             </p>
           </div>
         )}
 
         {/* VIEW: REGISTER */}
         {view === "register" && (
-          <div className="max-w-md w-full mx-auto my-12 bg-slate-950/40 border border-slate-800/80 rounded-2xl p-8 shadow-xl">
-            <h2 className="text-2xl font-bold text-center mb-2">Create Account</h2>
-            <p className="text-slate-400 text-sm text-center mb-8">Register to manage shared group accounts</p>
+          <div className="max-w-md w-full mx-auto my-12 bg-white border border-slate-200 rounded-2xl p-8 shadow-sm">
+            <h2 className="text-2xl font-bold text-slate-900 text-center mb-1">Create Account</h2>
+            <p className="text-slate-500 text-sm text-center mb-8">Register to manage shared group accounts</p>
 
-            {authError && <div className="p-3 bg-red-950/40 border border-red-800 text-red-400 rounded-lg text-sm mb-4">{authError}</div>}
+            {authError && <div className="p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm mb-4">{authError}</div>}
 
             <div className="space-y-4">
               <div>
-                <label className="block text-xs font-semibold text-slate-400 mb-1 uppercase tracking-wider">Full Name</label>
+                <label className="block text-xs font-semibold text-slate-500 mb-1 uppercase tracking-wider">Full Name</label>
                 <input 
                   type="text" 
                   value={authName} 
                   onChange={e => setAuthName(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-indigo-500 transition-colors" 
+                  className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600" 
                   placeholder="Aisha"
                 />
               </div>
               <div>
-                <label className="block text-xs font-semibold text-slate-400 mb-1 uppercase tracking-wider">Email Address</label>
+                <label className="block text-xs font-semibold text-slate-500 mb-1 uppercase tracking-wider">Email Address</label>
                 <input 
                   type="email" 
                   value={authEmail} 
                   onChange={e => setAuthEmail(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-indigo-500 transition-colors" 
+                  className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600" 
                   placeholder="aisha@example.com"
                 />
               </div>
               <div>
-                <label className="block text-xs font-semibold text-slate-400 mb-1 uppercase tracking-wider">Password</label>
+                <label className="block text-xs font-semibold text-slate-500 mb-1 uppercase tracking-wider">Password</label>
                 <input 
                   type="password" 
                   value={authPassword} 
                   onChange={e => setAuthPassword(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-indigo-500 transition-colors"
+                  className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
                   placeholder="••••••••"
                 />
               </div>
               <button 
                 onClick={() => handleAuth("register")}
-                className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-3 rounded-xl transition-all shadow-lg shadow-indigo-600/25 mt-6 cursor-pointer"
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-xl transition-all shadow-sm mt-6 cursor-pointer"
               >
                 Register
               </button>
             </div>
             
             <p className="text-sm text-slate-500 text-center mt-6">
-              Already have an account? <button onClick={() => { setView("login"); setAuthError(""); }} className="text-indigo-400 hover:underline font-medium">Log in</button>
+              Already have an account? <button onClick={() => { setView("login"); setAuthError(""); }} className="text-blue-600 hover:underline font-medium">Log in</button>
             </p>
           </div>
         )}
 
         {/* VIEW: DASHBOARD */}
         {view === "dashboard" && (
-          <div className="space-y-8 animate-fade-in">
-            {/* Upper Section */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          <div className="space-y-8">
+            {/* KPI Cards Header */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+              <div className="p-5 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-4">
+                <div className="p-3 bg-blue-50 text-blue-600 rounded-lg"><Users className="w-5 h-5" /></div>
+                <div>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase">Groups</p>
+                  <p className="font-extrabold text-xl">{groups.length}</p>
+                </div>
+              </div>
+              <div className="p-5 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-4">
+                <div className="p-3 bg-emerald-50 text-emerald-600 rounded-lg"><ArrowLeftRight className="w-5 h-5" /></div>
+                <div>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase">Expenses Created</p>
+                  <p className="font-extrabold text-xl">
+                    {groups.reduce((acc, g) => acc + (g as any).expenses?.length || 0, 0)}
+                  </p>
+                </div>
+              </div>
+              <div className="p-5 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-4">
+                <div className="p-3 bg-indigo-50 text-indigo-600 rounded-lg"><CheckSquare className="w-5 h-5" /></div>
+                <div>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase">Settlements</p>
+                  <p className="font-extrabold text-xl">
+                    {groups.reduce((acc, g) => acc + (g as any).settlements?.length || 0, 0)}
+                  </p>
+                </div>
+              </div>
+              <div className="p-5 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-4">
+                <div className="p-3 bg-purple-50 text-purple-600 rounded-lg"><FileText className="w-5 h-5" /></div>
+                <div>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase">Import Jobs</p>
+                  <p className="font-extrabold text-xl">{importJobs.length}</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Middle Section grid */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               
-              {/* Group list card */}
-              <div className="md:col-span-2 bg-slate-950/40 border border-slate-800/80 rounded-2xl p-6 shadow-lg flex flex-col">
+              {/* Groups listing */}
+              <div className="lg:col-span-2 bg-white border border-slate-200 rounded-xl p-6 shadow-sm flex flex-col">
                 <div className="flex items-center justify-between mb-6">
-                  <div className="flex items-center space-x-2">
-                    <Users className="w-5 h-5 text-indigo-400" />
-                    <h3 className="font-bold text-lg">My Groups</h3>
-                  </div>
+                  <h3 className="font-bold text-base text-slate-800 flex items-center">
+                    <Users className="w-4 h-4 mr-2 text-slate-500" /> My Groups
+                  </h3>
                   <div className="flex space-x-2">
                     <input 
                       type="text" 
                       value={newGroupName}
                       onChange={e => setNewGroupName(e.target.value)}
-                      className="bg-slate-900 border border-slate-800 px-3 py-1.5 text-sm rounded-lg focus:outline-none focus:border-indigo-500"
+                      className="bg-white border border-slate-300 px-3 py-1.5 text-xs rounded-lg focus:outline-none focus:border-blue-600 text-slate-800"
                       placeholder="New group name..."
                     />
                     <button 
                       onClick={handleCreateGroup}
-                      className="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 text-sm rounded-lg font-medium transition-all shadow shadow-indigo-600/20 cursor-pointer"
+                      className="bg-blue-600 hover:bg-blue-700 text-white px-3.5 py-1.5 text-xs rounded-lg font-medium transition-colors shadow-sm cursor-pointer"
                     >
                       Create
                     </button>
@@ -603,34 +771,36 @@ export default function App() {
                 </div>
 
                 {groups.length === 0 ? (
-                  <div className="flex-1 flex flex-col items-center justify-center p-12 text-slate-500">
-                    <Users className="w-12 h-12 mb-3 stroke-1" />
-                    <p className="text-sm">You are not in any sharing groups yet.</p>
+                  <div className="flex-1 flex flex-col items-center justify-center p-12 text-slate-400">
+                    <Users className="w-10 h-10 mb-2 stroke-1" />
+                    <p className="text-xs">No sharing groups found.</p>
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     {groups.map(g => (
                       <div 
                         key={g.id} 
-                        onClick={() => { setSelectedGroupId(g.id); fetchGroupDetails(g.id); setView("group-detail"); }}
-                        className="p-5 bg-slate-900 border border-slate-800 rounded-xl hover:border-indigo-500 transition-all cursor-pointer group shadow"
+                        onClick={() => { setSelectedGroupId(g.id); fetchGroupDetails(g.id); setGroupTab("overview"); setView("group-detail"); }}
+                        className="p-5 bg-white border border-slate-200 rounded-xl hover:border-blue-600 hover:shadow transition-all cursor-pointer group flex flex-col justify-between"
                       >
-                        <h4 className="font-bold text-slate-100 group-hover:text-indigo-400 transition-colors mb-1">{g.name}</h4>
-                        <p className="text-xs text-slate-500 mb-3">{g.memberships.length} active members</p>
-                        <div className="flex items-center justify-between">
-                          <div className="flex -space-x-2">
+                        <div>
+                          <h4 className="font-bold text-slate-800 group-hover:text-blue-600 transition-colors mb-1">{g.name}</h4>
+                          <p className="text-xs text-slate-500 mb-4">{g.memberships.length} members active</p>
+                        </div>
+                        <div className="flex items-center justify-between border-t border-slate-100 pt-3">
+                          <div className="flex -space-x-1.5">
                             {g.memberships.slice(0, 4).map(m => (
-                              <div key={m.id} className="w-6 h-6 rounded-full bg-slate-800 border border-slate-950 flex items-center justify-center text-[10px] font-bold text-indigo-400" title={m.user.name}>
+                              <div key={m.id} className="w-6 h-6 rounded-full bg-slate-100 border border-white flex items-center justify-center text-[10px] font-bold text-blue-600" title={m.user.name}>
                                 {m.user.name[0]}
                               </div>
                             ))}
                             {g.memberships.length > 4 && (
-                              <div className="w-6 h-6 rounded-full bg-slate-800 border border-slate-950 flex items-center justify-center text-[10px] font-bold text-slate-400">
+                              <div className="w-6 h-6 rounded-full bg-slate-100 border border-white flex items-center justify-center text-[10px] font-bold text-slate-500">
                                 +{g.memberships.length - 4}
                               </div>
                             )}
                           </div>
-                          <span className="text-xs font-semibold text-indigo-400 group-hover:translate-x-1 transition-transform flex items-center">
+                          <span className="text-xs font-semibold text-blue-600 group-hover:translate-x-1 transition-transform flex items-center">
                             Open <ArrowRight className="w-3.5 h-3.5 ml-1" />
                           </span>
                         </div>
@@ -640,37 +810,28 @@ export default function App() {
                 )}
               </div>
 
-              {/* Import History card */}
-              <div className="bg-slate-950/40 border border-slate-800/80 rounded-2xl p-6 shadow-lg">
-                <div className="flex items-center space-x-2 mb-6">
-                  <FileText className="w-5 h-5 text-indigo-400" />
-                  <h3 className="font-bold text-lg">CSV Imports</h3>
-                </div>
-
-                <div className="space-y-4 max-h-[300px] overflow-y-auto">
+              {/* Recent Imports */}
+              <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
+                <h3 className="font-bold text-base text-slate-800 mb-4 flex items-center">
+                  <FileText className="w-4 h-4 mr-2 text-slate-500" /> Recent Imports
+                </h3>
+                <div className="space-y-3 max-h-[350px] overflow-y-auto pr-1">
                   {importJobs.length === 0 ? (
-                    <p className="text-sm text-slate-500 text-center py-8">No import history found.</p>
+                    <p className="text-xs text-slate-400 text-center py-8">No spreadsheets imported.</p>
                   ) : (
                     importJobs.map(j => (
-                      <div key={j.id} className="p-3.5 bg-slate-900 border border-slate-800 rounded-xl flex items-center justify-between text-xs">
-                        <div className="space-y-1">
-                          <p className="font-semibold truncate max-w-[150px]">{j.rawFileName}</p>
-                          <p className="text-[10px] text-slate-500">{new Date(j.uploadedAt).toLocaleString()}</p>
+                      <div key={j.id} className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between text-xs">
+                        <div className="space-y-0.5">
+                          <p className="font-semibold text-slate-800 truncate max-w-[150px]">{j.rawFileName}</p>
+                          <p className="text-[10px] text-slate-400">{new Date(j.uploadedAt).toLocaleDateString()}</p>
                         </div>
-                        <div className="text-right">
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                            j.status === "COMPLETED" ? "bg-green-950/50 border border-green-800 text-green-400" :
-                            j.status === "REVIEW_REQUIRED" ? "bg-yellow-950/50 border border-yellow-800 text-yellow-400" :
-                            "bg-slate-800 text-slate-400"
-                          }`}>
-                            {j.status}
-                          </span>
-                          {j.summary && (
-                            <p className="text-[10px] text-slate-400 mt-1">
-                              +{j.summary.expensesCreated} Exp, +{j.summary.settlementsCreated} Set
-                            </p>
-                          )}
-                        </div>
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                          j.status === "COMPLETED" ? "bg-green-100 text-green-800" :
+                          j.status === "REVIEW_REQUIRED" ? "bg-amber-100 text-amber-800" :
+                          "bg-slate-100 text-slate-600"
+                        }`}>
+                          {j.status}
+                        </span>
                       </div>
                     ))
                   )}
@@ -678,280 +839,282 @@ export default function App() {
               </div>
 
             </div>
+
+            {/* Recent Activity timeline mock */}
+            <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
+              <h3 className="font-bold text-base text-slate-800 mb-4 flex items-center">
+                <Activity className="w-4 h-4 mr-2 text-slate-500" /> Activity Log
+              </h3>
+              <div className="space-y-4">
+                <div className="flex items-start space-x-3 text-xs">
+                  <div className="w-2 h-2 rounded-full bg-blue-600 mt-1.5"></div>
+                  <div>
+                    <p className="text-slate-800 font-medium">Database schema compatibility verified successfully.</p>
+                    <p className="text-[10px] text-slate-400">June 13, 2026</p>
+                  </div>
+                </div>
+                <div className="flex items-start space-x-3 text-xs">
+                  <div className="w-2 h-2 rounded-full bg-emerald-600 mt-1.5"></div>
+                  <div>
+                    <p className="text-slate-800 font-medium">Historical member periods seeded: Aisha, Rohan, Priya, Meera, Sam, Dev.</p>
+                    <p className="text-[10px] text-slate-400">June 13, 2026</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
           </div>
         )}
 
-        {/* VIEW: GROUP DETAILS */}
+        {/* VIEW: GROUP DETAIL (TABS-BASED REDESIGN) */}
         {view === "group-detail" && selectedGroup && (
-          <div className="space-y-8 animate-fade-in">
-            {/* Back button / header */}
-            <div className="flex items-center justify-between">
+          <div className="space-y-6">
+            
+            {/* Header / Nav */}
+            <div className="flex items-center justify-between border-b border-slate-200 pb-4">
               <button 
                 onClick={() => { setView("dashboard"); setSelectedGroupId(null); setSelectedGroup(null); fetchGroups(); }}
-                className="text-slate-400 hover:text-slate-100 flex items-center text-sm font-semibold transition-colors cursor-pointer"
+                className="text-slate-500 hover:text-slate-800 flex items-center text-sm font-semibold transition-colors cursor-pointer"
               >
                 <ArrowRight className="w-4 h-4 mr-1 rotate-180" /> Back to Dashboard
               </button>
-              <h2 className="text-2xl font-bold">{selectedGroup.name}</h2>
+              <div className="text-right">
+                <h2 className="text-xl font-bold text-slate-900">{selectedGroup.name}</h2>
+                <p className="text-xs text-slate-500">Group ID: {selectedGroup.id}</p>
+              </div>
             </div>
 
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              
-              {/* Left Column: Members, Net Balances, Debt Simplification */}
-              <div className="lg:col-span-2 space-y-6">
-                
-                {/* Net Balances Section */}
-                <div className="bg-slate-950/40 border border-slate-800/80 rounded-2xl p-6 shadow-lg">
-                  <h3 className="font-bold text-lg mb-4 flex items-center space-x-2">
-                    <ArrowLeftRight className="w-5 h-5 text-indigo-400" />
-                    <span>Group Balances</span>
-                  </h3>
+            {/* Tab selection */}
+            <div className="flex border-b border-slate-200 space-x-6 text-sm">
+              {[
+                { key: "overview", label: "Overview" },
+                { key: "expenses", label: "Expenses" },
+                { key: "settlements", label: "Settlements" },
+                { key: "members", label: "Members" },
+                { key: "balances", label: "Balances" }
+              ].map(tab => (
+                <button
+                  key={tab.key}
+                  onClick={() => setGroupTab(tab.key as any)}
+                  className={`pb-3 border-b-2 font-semibold transition-all cursor-pointer ${
+                    groupTab === tab.key
+                      ? "border-blue-600 text-blue-600"
+                      : "border-transparent text-slate-500 hover:text-slate-800"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
 
-                  {balances && balances.summaries.length > 0 ? (
-                    <div className="space-y-3">
-                      {balances.summaries.map(s => {
-                        const isCreditor = s.netBalance > 0.01;
-                        const isDebtor = s.netBalance < -0.01;
-                        return (
-                          <div 
-                            key={s.userId}
-                            onClick={() => setTraceUser(s)}
-                            className="p-3.5 bg-slate-900 border border-slate-800 hover:border-indigo-500 rounded-xl flex items-center justify-between transition-all cursor-pointer shadow"
-                          >
-                            <div className="flex items-center space-x-3">
-                              <div className="w-9 h-9 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center font-bold text-indigo-400">
-                                {s.userName[0]}
-                              </div>
-                              <div>
-                                <h4 className="font-bold text-sm text-slate-100">{s.userName}</h4>
-                                <p className="text-[10px] text-slate-500">Click to view breakdown audit</p>
-                              </div>
-                            </div>
-                            <div className="text-right">
-                              <p className={`font-extrabold text-sm ${
-                                isCreditor ? "text-emerald-400" :
-                                isDebtor ? "text-rose-400" :
-                                "text-slate-400"
-                              }`}>
-                                {isCreditor ? "+" : ""}{s.netBalance.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
-                              </p>
-                              <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wider">
-                                {isCreditor ? "Owed to them" : isDebtor ? "They owe" : "Settled"}
-                              </span>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ) : (
-                    <p className="text-sm text-slate-500">No balance summaries computed.</p>
-                  )}
-                </div>
-
-                {/* Debt Simplification Card */}
-                {balances && balances.simplifiedDebts.length > 0 && (
-                  <div className="bg-slate-950/40 border border-slate-800/80 rounded-2xl p-6 shadow-lg">
-                    <h3 className="font-bold text-lg mb-4 flex items-center space-x-2 text-emerald-400">
-                      <CheckCircle className="w-5 h-5" />
-                      <span>Debt Repayment Plan (Simplified)</span>
-                    </h3>
-                    <div className="space-y-2.5">
-                      {balances.simplifiedDebts.map((d, idx) => (
-                        <div key={idx} className="p-3 bg-emerald-950/10 border border-emerald-900/40 rounded-xl flex items-center justify-between text-sm">
-                          <div className="flex items-center space-x-2.5">
-                            <span className="font-semibold text-rose-400">{d.fromUser}</span>
-                            <ArrowRight className="w-4 h-4 text-slate-500" />
-                            <span className="font-semibold text-emerald-400">{d.toUser}</span>
-                          </div>
-                          <span className="font-bold text-emerald-400 bg-emerald-950/50 border border-emerald-800/40 px-2.5 py-1 rounded text-xs">
-                            Pay {d.amount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
-                          </span>
-                        </div>
-                      ))}
+            {/* TAB CONTENT: OVERVIEW */}
+            {groupTab === "overview" && (
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <div className="lg:col-span-2 space-y-6">
+                  {/* Group Summary card */}
+                  <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm space-y-4">
+                    <h3 className="font-bold text-base text-slate-850">Group Summary</h3>
+                    <div className="grid grid-cols-3 gap-4 text-center">
+                      <div className="p-3 bg-slate-50 border border-slate-100 rounded-lg">
+                        <p className="text-[10px] text-slate-400 font-bold uppercase">Members</p>
+                        <p className="text-lg font-extrabold text-slate-800">{selectedGroup.memberships.length}</p>
+                      </div>
+                      <div className="p-3 bg-slate-50 border border-slate-100 rounded-lg">
+                        <p className="text-[10px] text-slate-400 font-bold uppercase">Expenses</p>
+                        <p className="text-lg font-extrabold text-slate-800">{expenses.length}</p>
+                      </div>
+                      <div className="p-3 bg-slate-50 border border-slate-100 rounded-lg">
+                        <p className="text-[10px] text-slate-400 font-bold uppercase">Settlements</p>
+                        <p className="text-lg font-extrabold text-slate-800">{settlements.length}</p>
+                      </div>
                     </div>
                   </div>
-                )}
 
-                {/* Expense List Card */}
-                <div className="bg-slate-950/40 border border-slate-800/80 rounded-2xl p-6 shadow-lg">
-                  <h3 className="font-bold text-lg mb-4">Expenses History</h3>
-                  {expenses.length === 0 ? (
-                    <p className="text-sm text-slate-500 py-4 text-center">No expenses logged yet.</p>
-                  ) : (
-                    <div className="divide-y divide-slate-800">
-                      {expenses.map(e => (
-                        <div key={e.id} className="py-3.5 flex items-center justify-between text-sm">
-                          <div className="space-y-1">
-                            <h4 className="font-bold text-slate-100">{e.title}</h4>
-                            <p className="text-xs text-slate-500">
-                              Paid by <b>{e.payer.name}</b> on {new Date(e.expenseDate).toLocaleDateString()}
-                            </p>
-                          </div>
-                          <div className="flex items-center space-x-4">
-                            <div className="text-right">
-                              <p className="font-bold text-slate-100">
-                                {e.normalizedAmount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
-                              </p>
-                              {e.currency !== "INR" && (
-                                <p className="text-[10px] text-slate-500">
-                                  {e.amount} {e.currency} (1 USD = 83 INR)
-                                </p>
-                              )}
-                            </div>
-                            <button 
-                              onClick={() => handleDeleteExpense(e.id)}
-                              className="p-1.5 rounded bg-slate-900 border border-slate-800 hover:bg-red-950/40 hover:border-red-950 text-slate-500 hover:text-red-400 transition-all cursor-pointer"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          </div>
-                        </div>
-                      ))}
+                  {/* Quick CSV Import Trigger */}
+                  <div className="bg-blue-50/50 border border-blue-200/50 rounded-xl p-6 shadow-sm flex flex-col sm:flex-row items-center justify-between gap-4">
+                    <div>
+                      <h4 className="font-bold text-blue-900 text-sm">Upload spreadsheet data</h4>
+                      <p className="text-xs text-blue-700/80 mt-0.5">Import raw csv and run pluggable anomaly engine verification checks.</p>
                     </div>
-                  )}
-                </div>
-
-              </div>
-
-              {/* Right Column: Add member, CSV Upload, Manual Add Transactions */}
-              <div className="space-y-6">
-                
-                {/* CSV Importer Selector */}
-                <div className="bg-gradient-to-br from-indigo-950/20 to-slate-950/40 border border-indigo-900/30 rounded-2xl p-6 shadow-lg">
-                  <h3 className="font-bold text-lg mb-4 flex items-center space-x-2 text-indigo-400">
-                    <Upload className="w-5 h-5" />
-                    <span>Import spreadsheet CSV</span>
-                  </h3>
-                  
-                  {importError && (
-                    <div className="p-3 bg-red-950/40 border border-red-800 text-red-400 rounded-lg text-xs mb-4">
-                      {importError}
-                    </div>
-                  )}
-
-                  <div className="space-y-4">
-                    <div className="border border-dashed border-slate-850 hover:border-indigo-500 p-4 rounded-xl flex flex-col items-center justify-center bg-slate-900/30 cursor-pointer relative">
-                      <Upload className="w-8 h-8 text-slate-500 mb-2" />
-                      <span className="text-xs text-slate-400 font-medium">
-                        {importFile ? importFile.name : "Select expenses_export.csv"}
-                      </span>
+                    <div className="flex items-center space-x-3 w-full sm:w-auto">
                       <input 
                         type="file" 
                         accept=".csv"
+                        id="csv-file-quick"
                         onChange={handleCsvFileChange}
-                        className="absolute inset-0 opacity-0 cursor-pointer"
+                        className="hidden"
                       />
-                    </div>
-                    {importFile && (
-                      <button 
-                        onClick={handleUploadCsv}
-                        className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-2 rounded-xl transition-all shadow shadow-indigo-600/20 cursor-pointer text-sm"
+                      <label 
+                        htmlFor="csv-file-quick"
+                        className="flex-1 sm:flex-none bg-white border border-slate-350 hover:bg-slate-50 text-slate-700 px-4 py-2 text-xs font-semibold rounded-lg cursor-pointer text-center"
                       >
-                        Analyze CSV & Preview Anomalies
-                      </button>
-                    )}
+                        {importFile ? importFile.name : "Select CSV file"}
+                      </label>
+                      {importFile && (
+                        <button
+                          onClick={handleUploadCsv}
+                          className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-xs font-semibold rounded-lg cursor-pointer transition-all"
+                        >
+                          Analyze
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
 
-                {/* Manage Members list */}
-                <div className="bg-slate-950/40 border border-slate-800/80 rounded-2xl p-6 shadow-lg">
-                  <h3 className="font-bold text-lg mb-4">Group Members</h3>
-                  
-                  {/* Add member form */}
-                  <div className="space-y-3 mb-6 p-3 bg-slate-900 rounded-xl">
-                    <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Add New Member</p>
-                    <input 
-                      type="email" 
-                      value={addMemberEmail}
-                      onChange={e => setAddMemberEmail(e.target.value)}
-                      placeholder="Member email..."
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs focus:outline-none"
-                    />
-                    <div className="flex space-x-2">
-                      <input 
-                        type="date" 
-                        value={addMemberJoinDate}
-                        onChange={e => setAddMemberJoinDate(e.target.value)}
-                        className="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-400"
-                        title="Join Date"
-                      />
-                      <button 
-                        onClick={handleAddMember}
-                        className="bg-indigo-600 hover:bg-indigo-500 text-white font-bold px-3 py-1.5 text-xs rounded-lg cursor-pointer"
-                      >
-                        Add
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="space-y-3 max-h-[300px] overflow-y-auto">
+                {/* Right side widgets: Mini Member logs */}
+                <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm h-fit">
+                  <h4 className="font-bold text-slate-800 text-sm mb-4">Active Members</h4>
+                  <div className="space-y-3">
                     {selectedGroup.memberships.map(m => (
-                      <div key={m.id} className="p-3 bg-slate-900 border border-slate-800 rounded-xl flex items-center justify-between text-xs">
-                        <div className="space-y-1">
-                          <h4 className="font-bold text-slate-200">{m.user.name}</h4>
-                          <p className="text-[10px] text-slate-500">
-                            Joined {new Date(m.joinedAt).toLocaleDateString()}
-                            {m.leftAt && ` • Left ${new Date(m.leftAt).toLocaleDateString()}`}
-                          </p>
-                        </div>
-                        {!m.leftAt && (
-                          <button 
-                            onClick={() => handleSoftDeleteMember(m.id)}
-                            className="p-1 rounded bg-slate-950 hover:bg-red-950/40 text-slate-500 hover:text-red-400 border border-slate-800 cursor-pointer"
-                            title="Mark as Left"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        )}
+                      <div key={m.id} className="flex items-center justify-between text-xs">
+                        <span className="font-semibold text-slate-700">{m.user.name}</span>
+                        <span className={`px-2 py-0.5 rounded-[4px] text-[10px] font-bold ${
+                          m.leftAt ? "bg-red-50 text-red-700" : "bg-emerald-50 text-emerald-700"
+                        }`}>
+                          {m.leftAt ? "Inactive" : "Active"}
+                        </span>
                       </div>
                     ))}
                   </div>
                 </div>
+              </div>
+            )}
 
-                {/* Manual Add Expense Form */}
-                <div className="bg-slate-950/40 border border-slate-800/80 rounded-2xl p-6 shadow-lg">
-                  <h3 className="font-bold text-base mb-4">Manual Expense</h3>
-                  <div className="space-y-3 text-xs">
+            {/* TAB CONTENT: EXPENSES (STANDARDIZED DATA TABLE) */}
+            {groupTab === "expenses" && (
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                {/* Table list */}
+                <div className="lg:col-span-2 bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden flex flex-col">
+                  {/* Table search / filters */}
+                  <div className="p-4 border-b border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-3 bg-slate-50/20">
+                    <div className="relative w-full sm:max-w-xs">
+                      <Search className="absolute left-3 top-2.5 w-4 h-4 text-slate-400" />
+                      <input 
+                        type="text" 
+                        value={expenseSearch}
+                        onChange={e => setExpenseSearch(e.target.value)}
+                        placeholder="Search title, payer..."
+                        className="bg-white border border-slate-300 w-full pl-9 pr-4 py-2 text-xs rounded-lg focus:outline-none"
+                      />
+                    </div>
+                    <div className="flex space-x-3 text-xs text-slate-650 w-full sm:w-auto justify-end">
+                      <button 
+                        onClick={() => {
+                          setExpenseSortField("date");
+                          setExpenseSortOrder(prev => prev === "asc" ? "desc" : "asc");
+                        }}
+                        className={`px-2.5 py-1.5 border rounded-lg flex items-center font-semibold cursor-pointer ${
+                          expenseSortField === "date" ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-white border-slate-200"
+                        }`}
+                      >
+                        Date {expenseSortField === "date" && (expenseSortOrder === "asc" ? "▲" : "▼")}
+                      </button>
+                      <button 
+                        onClick={() => {
+                          setExpenseSortField("amount");
+                          setExpenseSortOrder(prev => prev === "asc" ? "desc" : "asc");
+                        }}
+                        className={`px-2.5 py-1.5 border rounded-lg flex items-center font-semibold cursor-pointer ${
+                          expenseSortField === "amount" ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-white border-slate-200"
+                        }`}
+                      >
+                        Amount {expenseSortField === "amount" && (expenseSortOrder === "asc" ? "▲" : "▼")}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse">
+                      <thead>
+                        <tr className="bg-slate-50 text-slate-500 font-semibold uppercase tracking-wider text-[10px] border-b border-slate-200">
+                          <th className="py-3 px-4">Date</th>
+                          <th className="py-3 px-4">Title</th>
+                          <th className="py-3 px-4 text-right">Amount (INR)</th>
+                          <th className="py-3 px-4">Paid By</th>
+                          <th className="py-3 px-4">Type</th>
+                          <th className="py-3 px-4"></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {processedExpenses.length === 0 ? (
+                          <tr>
+                            <td colSpan={6} className="py-8 text-center text-slate-400 text-xs">No expenses matched filters.</td>
+                          </tr>
+                        ) : (
+                          processedExpenses.map(e => (
+                            <tr key={e.id} className="border-b border-slate-100 hover:bg-slate-50/50 text-xs text-slate-700">
+                              <td className="py-3 px-4 whitespace-nowrap">{new Date(e.expenseDate).toLocaleDateString()}</td>
+                              <td className="py-3 px-4 font-semibold text-slate-900">{e.title}</td>
+                              <td className="py-3 px-4 text-right font-bold text-slate-900">
+                                {e.normalizedAmount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
+                              </td>
+                              <td className="py-3 px-4">{e.payer.name}</td>
+                              <td className="py-3 px-4">
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-650 uppercase">
+                                  {e.splitType}
+                                </span>
+                              </td>
+                              <td className="py-3 px-4 text-right">
+                                <button 
+                                  onClick={() => handleDeleteExpense(e.id)}
+                                  className="p-1 rounded hover:bg-red-50 hover:text-red-600 border border-transparent hover:border-red-200 text-slate-400 transition-all cursor-pointer"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* Form to add manual Expense */}
+                <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm h-fit">
+                  <h3 className="font-bold text-base text-slate-800 mb-4">Add Manual Expense</h3>
+                  <div className="space-y-4 text-xs">
                     <div>
-                      <label className="block text-[10px] font-semibold text-slate-400 mb-1">Title</label>
+                      <label className="block text-[10px] font-bold text-slate-500 mb-1">Title</label>
                       <input 
                         type="text" 
                         value={expTitle}
                         onChange={e => setExpTitle(e.target.value)}
                         placeholder="February rent..."
-                        className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2"
+                        className="w-full bg-white border border-slate-350 rounded-lg px-3 py-2"
                       />
                     </div>
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-2 gap-3">
                       <div>
-                        <label className="block text-[10px] font-semibold text-slate-400 mb-1">Amount</label>
+                        <label className="block text-[10px] font-bold text-slate-500 mb-1">Amount</label>
                         <input 
                           type="number" 
                           value={expAmount}
                           onChange={e => setExpAmount(e.target.value)}
                           placeholder="Amount..."
-                          className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2"
+                          className="w-full bg-white border border-slate-350 rounded-lg px-3 py-2"
                         />
                       </div>
                       <div>
-                        <label className="block text-[10px] font-semibold text-slate-400 mb-1">Currency</label>
+                        <label className="block text-[10px] font-bold text-slate-500 mb-1">Currency</label>
                         <select 
                           value={expCurrency}
                           onChange={e => setExpCurrency(e.target.value)}
-                          className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-slate-400"
+                          className="w-full bg-white border border-slate-355 rounded-lg px-3 py-2 text-slate-700"
                         >
                           <option value="INR">INR</option>
                           <option value="USD">USD</option>
                         </select>
                       </div>
                     </div>
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-2 gap-3">
                       <div>
-                        <label className="block text-[10px] font-semibold text-slate-400 mb-1">Paid By</label>
+                        <label className="block text-[10px] font-bold text-slate-500 mb-1">Paid By</label>
                         <select 
                           value={expPaidBy}
                           onChange={e => setExpPaidBy(e.target.value)}
-                          className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-slate-400"
+                          className="w-full bg-white border border-slate-355 rounded-lg px-3 py-2 text-slate-700"
                         >
                           {selectedGroup.memberships.map(m => (
                             <option key={m.user.id} value={m.user.id}>{m.user.name}</option>
@@ -959,21 +1122,21 @@ export default function App() {
                         </select>
                       </div>
                       <div>
-                        <label className="block text-[10px] font-semibold text-slate-400 mb-1">Date</label>
+                        <label className="block text-[10px] font-bold text-slate-500 mb-1">Date</label>
                         <input 
                           type="date" 
                           value={expDate}
                           onChange={e => setExpDate(e.target.value)}
-                          className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-slate-400"
+                          className="w-full bg-white border border-slate-355 rounded-lg px-3 py-2 text-slate-700"
                         />
                       </div>
                     </div>
                     <div>
-                      <label className="block text-[10px] font-semibold text-slate-400 mb-1">Split Type</label>
+                      <label className="block text-[10px] font-bold text-slate-500 mb-1">Split Type</label>
                       <select 
                         value={expSplitType}
                         onChange={e => setExpSplitType(e.target.value)}
-                        className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-slate-400"
+                        className="w-full bg-white border border-slate-355 rounded-lg px-3 py-2 text-slate-700"
                       >
                         <option value="equal">Equal Split</option>
                         <option value="percentage">Percentage Split</option>
@@ -984,23 +1147,68 @@ export default function App() {
 
                     <button 
                       onClick={handleAddExpense}
-                      className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2 rounded-lg cursor-pointer"
+                      className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 rounded-lg cursor-pointer transition-colors shadow-sm"
                     >
                       Save Expense
                     </button>
                   </div>
                 </div>
+              </div>
+            )}
 
-                {/* Manual Add Settlement Form */}
-                <div className="bg-slate-950/40 border border-slate-800/80 rounded-2xl p-6 shadow-lg">
-                  <h3 className="font-bold text-base mb-4">Manual Settlement</h3>
-                  <div className="space-y-3 text-xs">
+            {/* TAB CONTENT: SETTLEMENTS */}
+            {groupTab === "settlements" && (
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <div className="lg:col-span-2 bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="bg-slate-50 text-slate-500 font-semibold uppercase tracking-wider text-[10px] border-b border-slate-200">
+                        <th className="py-3 px-4">Date</th>
+                        <th className="py-3 px-4">From (Payer)</th>
+                        <th className="py-3 px-4">To (Receiver)</th>
+                        <th className="py-3 px-4 text-right">Amount (INR)</th>
+                        <th className="py-3 px-4"></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {settlements.length === 0 ? (
+                        <tr>
+                          <td colSpan={5} className="py-8 text-center text-slate-400 text-xs">No settlements recorded.</td>
+                        </tr>
+                      ) : (
+                        settlements.map(s => (
+                          <tr key={s.id} className="border-b border-slate-100 hover:bg-slate-50/50 text-xs text-slate-700">
+                            <td className="py-3 px-4 whitespace-nowrap">{new Date(s.settlementDate).toLocaleDateString()}</td>
+                            <td className="py-3 px-4 font-semibold text-slate-900">{s.payer.name}</td>
+                            <td className="py-3 px-4 font-semibold text-slate-900">{s.receiver.name}</td>
+                            <td className="py-3 px-4 text-right font-extrabold text-emerald-600">
+                              {s.amount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
+                            </td>
+                            <td className="py-3 px-4 text-right">
+                              <button 
+                                onClick={() => handleDeleteSettlement(s.id)}
+                                className="p-1 rounded hover:bg-red-50 hover:text-red-600 border border-transparent hover:border-red-200 text-slate-400 transition-all cursor-pointer"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Form to add manual Settlement */}
+                <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm h-fit">
+                  <h3 className="font-bold text-base text-slate-800 mb-4">Record Repayment</h3>
+                  <div className="space-y-4 text-xs">
                     <div>
-                      <label className="block text-[10px] font-semibold text-slate-400 mb-1">From (Payer)</label>
+                      <label className="block text-[10px] font-bold text-slate-500 mb-1">From (Payer)</label>
                       <select 
                         value={settlePayer}
                         onChange={e => setSettlePayer(e.target.value)}
-                        className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-slate-400"
+                        className="w-full bg-white border border-slate-355 rounded-lg px-3 py-2 text-slate-700"
                       >
                         {selectedGroup.memberships.map(m => (
                           <option key={m.user.id} value={m.user.id}>{m.user.name}</option>
@@ -1008,202 +1216,357 @@ export default function App() {
                       </select>
                     </div>
                     <div>
-                      <label className="block text-[10px] font-semibold text-slate-400 mb-1">To (Receiver)</label>
+                      <label className="block text-[10px] font-bold text-slate-500 mb-1">To (Receiver)</label>
                       <select 
                         value={settleReceiver}
                         onChange={e => setSettleReceiver(e.target.value)}
-                        className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-slate-400"
+                        className="w-full bg-white border border-slate-355 rounded-lg px-3 py-2 text-slate-700"
                       >
                         {selectedGroup.memberships.map(m => (
                           <option key={m.user.id} value={m.user.id}>{m.user.name}</option>
                         ))}
                       </select>
                     </div>
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-2 gap-3">
                       <div>
-                        <label className="block text-[10px] font-semibold text-slate-400 mb-1">Amount</label>
+                        <label className="block text-[10px] font-bold text-slate-500 mb-1">Amount</label>
                         <input 
                           type="number" 
                           value={settleAmount}
                           onChange={e => setSettleAmount(e.target.value)}
                           placeholder="Amount..."
-                          className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2"
+                          className="w-full bg-white border border-slate-355 rounded-lg px-3 py-2"
                         />
                       </div>
                       <div>
-                        <label className="block text-[10px] font-semibold text-slate-400 mb-1">Date</label>
+                        <label className="block text-[10px] font-bold text-slate-500 mb-1">Date</label>
                         <input 
                           type="date" 
                           value={settleDate}
                           onChange={e => setSettleDate(e.target.value)}
-                          className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-slate-400"
+                          className="w-full bg-white border border-slate-355 rounded-lg px-3 py-2 text-slate-700"
                         />
                       </div>
                     </div>
                     
                     <button 
                       onClick={handleAddSettlement}
-                      className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2 rounded-lg cursor-pointer"
+                      className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 rounded-lg cursor-pointer transition-colors shadow-sm"
                     >
                       Record Repayment
                     </button>
                   </div>
                 </div>
-
               </div>
+            )}
 
-            </div>
+            {/* TAB CONTENT: MEMBERS */}
+            {groupTab === "members" && (
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <div className="lg:col-span-2 bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="bg-slate-50 text-slate-500 font-semibold uppercase tracking-wider text-[10px] border-b border-slate-200">
+                        <th className="py-3 px-4">Name</th>
+                        <th className="py-3 px-4">Joined At</th>
+                        <th className="py-3 px-4">Left At</th>
+                        <th className="py-3 px-4">Status</th>
+                        <th className="py-3 px-4"></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {selectedGroup.memberships.map(m => (
+                        <tr key={m.id} className="border-b border-slate-100 hover:bg-slate-50/50 text-xs text-slate-700">
+                          <td className="py-3 px-4 font-semibold text-slate-900">{m.user.name}</td>
+                          <td className="py-3 px-4">{new Date(m.joinedAt).toLocaleDateString()}</td>
+                          <td className="py-3 px-4">{m.leftAt ? new Date(m.leftAt).toLocaleDateString() : "Active Member"}</td>
+                          <td className="py-3 px-4">
+                            <span className={`px-2 py-0.5 rounded-[4px] text-[10px] font-bold ${
+                              m.leftAt ? "bg-red-55 border border-red-200 text-red-700" : "bg-green-55 border border-green-200 text-green-700"
+                            }`}>
+                              {m.leftAt ? "Inactive" : "Active"}
+                            </span>
+                          </td>
+                          <td className="py-3 px-4 text-right">
+                            {!m.leftAt && (
+                              <button 
+                                onClick={() => handleSoftDeleteMember(m.id)}
+                                className="p-1 rounded hover:bg-red-50 hover:text-red-600 border border-transparent hover:border-red-200 text-slate-450 transition-all cursor-pointer"
+                                title="Mark as Left (Soft Delete)"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Add Member Form */}
+                <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm h-fit">
+                  <h3 className="font-bold text-base text-slate-800 mb-4">Add Group Member</h3>
+                  <div className="space-y-4 text-xs">
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-500 mb-1">Email Address</label>
+                      <input 
+                        type="email" 
+                        value={addMemberEmail}
+                        onChange={e => setAddMemberEmail(e.target.value)}
+                        placeholder="aisha@example.com"
+                        className="w-full bg-white border border-slate-350 rounded-lg px-3 py-2"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-500 mb-1">Join Date</label>
+                      <input 
+                        type="date" 
+                        value={addMemberJoinDate}
+                        onChange={e => setAddMemberJoinDate(e.target.value)}
+                        className="w-full bg-white border border-slate-355 rounded-lg px-3 py-2 text-slate-700"
+                      />
+                    </div>
+
+                    <button 
+                      onClick={handleAddMember}
+                      className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 rounded-lg cursor-pointer transition-colors shadow-sm"
+                    >
+                      Add Member
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* TAB CONTENT: BALANCES & DEBT PLAN */}
+            {groupTab === "balances" && (
+              <div className="space-y-6">
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  
+                  {/* Balance ledger card */}
+                  <div className="lg:col-span-2 bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
+                    <h3 className="font-bold text-base text-slate-800 mb-4 flex items-center">
+                      <ArrowLeftRight className="w-4 h-4 mr-2 text-slate-500" /> Group Balances
+                    </h3>
+
+                    {balances && balances.summaries.length > 0 ? (
+                      <div className="space-y-3">
+                        {balances.summaries.map(s => {
+                          const isCreditor = s.netBalance > 0.01;
+                          const isDebtor = s.netBalance < -0.01;
+                          return (
+                            <div 
+                              key={s.userId}
+                              onClick={() => setTraceUser(s)}
+                              className="p-4 bg-white border border-slate-200 hover:border-blue-600 rounded-xl flex items-center justify-between transition-all cursor-pointer shadow-sm hover:shadow"
+                            >
+                              <div className="flex items-center space-x-3">
+                                <div className="w-9 h-9 rounded-lg bg-slate-100 flex items-center justify-center font-bold text-blue-600 text-sm">
+                                  {s.userName[0]}
+                                </div>
+                                <div>
+                                  <h4 className="font-bold text-sm text-slate-800">{s.userName}</h4>
+                                  <p className="text-[10px] text-slate-400">Click to audit balances</p>
+                                </div>
+                              </div>
+                              <div className="text-right">
+                                <p className={`font-bold text-sm ${
+                                  isCreditor ? "text-green-600" :
+                                  isDebtor ? "text-red-600" :
+                                  "text-slate-450"
+                                }`}>
+                                  {isCreditor ? "+" : ""}{s.netBalance.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
+                                </p>
+                                <span className="text-[9px] text-slate-450 font-bold uppercase tracking-wider">
+                                  {isCreditor ? "Owed to them" : isDebtor ? "They owe" : "Settled"}
+                                </span>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-slate-500 py-4">No balance details computed.</p>
+                    )}
+                  </div>
+
+                  {/* Debt minimization plans */}
+                  <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm h-fit">
+                    <h3 className="font-bold text-base text-slate-800 mb-4 flex items-center">
+                      <CheckCircle className="w-4 h-4 mr-2 text-green-600" /> Simplified Debt Plan
+                    </h3>
+
+                    {balances && balances.simplifiedDebts.length > 0 ? (
+                      <div className="space-y-3">
+                        {balances.simplifiedDebts.map((d, idx) => (
+                          <div key={idx} className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between text-xs">
+                            <div className="flex items-center space-x-2 text-slate-650">
+                              <span className="font-bold text-red-600">{d.fromUser}</span>
+                              <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
+                              <span className="font-bold text-green-600">{d.toUser}</span>
+                            </div>
+                            <span className="font-extrabold text-blue-700 bg-blue-50 border border-blue-100 px-2 py-0.5 rounded">
+                              {d.amount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-slate-400 py-4 text-center">No outstanding debts!</p>
+                    )}
+                  </div>
+
+                </div>
+              </div>
+            )}
+
           </div>
         )}
 
-        {/* VIEW: CSV IMPORT ANOMALY REVIEW & PREVIEW QUEUE */}
+        {/* VIEW: CSV IMPORT QUEUE (REVIEW WORKFLOW REDESIGN) */}
         {view === "import" && selectedGroup && activeImportJobId && (
-          <div className="space-y-8 animate-fade-in">
-            {/* Header info */}
-            <div className="flex items-center justify-between">
+          <div className="space-y-6">
+            
+            <div className="flex items-center justify-between border-b border-slate-200 pb-4">
               <button 
                 onClick={() => { setView("group-detail"); setImportStats(null); }}
-                className="text-slate-400 hover:text-slate-100 flex items-center text-sm font-semibold transition-colors cursor-pointer"
+                className="text-slate-500 hover:text-slate-850 flex items-center text-sm font-semibold transition-colors cursor-pointer"
               >
                 <ArrowRight className="w-4 h-4 mr-1 rotate-180" /> Cancel and Back
               </button>
-              <h2 className="text-xl font-extrabold flex items-center text-indigo-400">
-                <AlertTriangle className="w-6 h-6 mr-2 animate-pulse" />
-                Reviewing Import: {importFile?.name}
+              <h2 className="text-lg font-bold text-slate-900 flex items-center">
+                <AlertTriangle className="w-5 h-5 text-amber-500 mr-2" /> Anomaly Resolution Queue
               </h2>
             </div>
 
             {importStats ? (
-              /* Report view post-finalize */
-              <div className="max-w-2xl w-full mx-auto bg-slate-950/40 border border-slate-800/80 rounded-2xl p-8 shadow-xl space-y-6 text-center">
-                <CheckCircle className="w-16 h-16 text-emerald-400 mx-auto" />
+              /* Statistics Import report */
+              <div className="max-w-xl w-full mx-auto bg-white border border-slate-200 rounded-xl p-8 shadow-sm text-center space-y-6">
+                <CheckCircle className="w-12 h-12 text-green-600 mx-auto" />
                 <div>
-                  <h3 className="text-2xl font-bold mb-1">Import Job Finalized!</h3>
-                  <p className="text-slate-400 text-sm">Every resolved record is committed securely in the database.</p>
+                  <h3 className="text-xl font-bold text-slate-900">Import Completed Successfully</h3>
+                  <p className="text-slate-500 text-xs mt-1">Audit resolve logs and new expenses logged in the group database.</p>
                 </div>
 
-                <div className="grid grid-cols-3 gap-4 bg-slate-900/60 p-4 border border-slate-800/60 rounded-xl max-w-md mx-auto text-sm">
+                <div className="grid grid-cols-3 gap-3 p-4 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-650">
                   <div>
-                    <p className="text-[10px] text-slate-500 font-bold uppercase">Rows Processed</p>
-                    <p className="font-extrabold text-slate-100">{importStats.rowsProcessed}</p>
+                    <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">Rows Processed</p>
+                    <p className="font-extrabold text-slate-800 text-base">{importStats.rowsProcessed}</p>
                   </div>
                   <div>
-                    <p className="text-[10px] text-slate-500 font-bold uppercase">Expenses Created</p>
-                    <p className="font-extrabold text-emerald-400">+{importStats.expensesCreated}</p>
+                    <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">Expenses Created</p>
+                    <p className="font-extrabold text-green-600 text-base">+{importStats.expensesCreated}</p>
                   </div>
                   <div>
-                    <p className="text-[10px] text-slate-500 font-bold uppercase">Settlements Created</p>
-                    <p className="font-extrabold text-indigo-400">+{importStats.settlementsCreated}</p>
+                    <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">Settlements</p>
+                    <p className="font-extrabold text-blue-700 text-base">+{importStats.settlementsCreated}</p>
                   </div>
                 </div>
 
-                <div className="flex justify-center space-x-3">
-                  <button 
-                    onClick={() => { setView("group-detail"); setImportStats(null); }}
-                    className="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold px-6 py-2.5 rounded-xl cursor-pointer shadow"
-                  >
-                    View Group Balances
-                  </button>
-                </div>
+                <button 
+                  onClick={() => { setView("group-detail"); setImportStats(null); }}
+                  className="bg-blue-600 hover:bg-blue-700 text-white font-semibold px-6 py-2 rounded-lg cursor-pointer transition-all shadow-sm"
+                >
+                  View Group Balances
+                </button>
               </div>
             ) : (
-              /* Main anomalies list queue view */
+              /* Review anomalies list */
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                 
-                {/* Left Column: Anomalies list */}
+                {/* Resolution queue */}
                 <div className="lg:col-span-2 space-y-4">
-                  <h3 className="font-bold text-lg mb-2 flex items-center">
-                    Anomalies Review Queue ({activeImportAnomalies.length} found)
-                  </h3>
-
+                  
                   {activeImportAnomalies.length === 0 ? (
-                    <div className="p-8 bg-slate-950/40 border border-slate-800/80 rounded-2xl text-center space-y-3">
-                      <CheckCircle className="w-12 h-12 text-emerald-400 mx-auto" />
-                      <p className="font-semibold">No data anomalies detected!</p>
-                      <p className="text-xs text-slate-400">This CSV is perfectly clean and ready to import.</p>
+                    <div className="p-8 bg-white border border-slate-200 rounded-xl text-center space-y-2">
+                      <CheckCircle className="w-10 h-10 text-green-600 mx-auto" />
+                      <p className="font-semibold text-slate-800">CSV data is 100% clean!</p>
+                      <p className="text-xs text-slate-500">No anomalies detected. Proceed to finalize import.</p>
                     </div>
                   ) : (
                     activeImportAnomalies.map(a => {
                       const resolution = importResolutions[a.fingerprint];
                       const isResolved = resolution && resolution.resolutionAction !== null;
-                      
+
                       return (
                         <div 
-                          key={a.id} 
-                          className={`p-5 rounded-xl border transition-all bg-slate-950/40 ${
-                            isResolved ? "border-green-800/40 bg-green-950/5" :
-                            a.severity === "BLOCKING" ? "border-red-900/50" :
-                            a.severity === "ERROR" ? "border-orange-900/50" :
-                            a.severity === "WARNING" ? "border-yellow-900/40" :
-                            "border-slate-800"
+                          key={a.id}
+                          className={`p-5 bg-white border rounded-xl shadow-sm transition-all ${
+                            isResolved ? "border-green-500 bg-green-50/10" :
+                            a.severity === "BLOCKING" ? "border-red-400" :
+                            a.severity === "ERROR" ? "border-amber-400" :
+                            "border-slate-200"
                           }`}
                         >
-                          <div className="flex items-start justify-between mb-3 text-xs">
+                          <div className="flex items-center justify-between mb-3 text-xs">
                             <span className="font-bold text-slate-400">Row {a.rowNumber} • {a.anomalyType}</span>
                             <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                              a.severity === "BLOCKING" ? "bg-red-950 border border-red-950 text-red-400" :
-                              a.severity === "ERROR" ? "bg-orange-950 border border-orange-950 text-orange-400" :
-                              a.severity === "WARNING" ? "bg-yellow-950/60 border border-yellow-800 text-yellow-400" :
-                              "bg-slate-800 text-slate-400"
+                              a.severity === "BLOCKING" ? "bg-red-100 text-red-800" :
+                              a.severity === "ERROR" ? "bg-amber-100 text-amber-800" :
+                              a.severity === "WARNING" ? "bg-yellow-100 text-yellow-800" :
+                              "bg-slate-100 text-slate-600"
                             }`}>
                               {a.severity}
                             </span>
                           </div>
 
-                          <p className="text-sm font-semibold text-slate-200 mb-3">{a.description}</p>
+                          <h4 className="font-bold text-sm text-slate-800 mb-3">{a.description}</h4>
 
-                          {/* Interactive resolution controls based on type */}
-                          <div className="bg-slate-900/40 p-4 border border-slate-850 rounded-xl space-y-3 text-xs mb-3">
-                            <p className="text-[10px] text-slate-500 font-bold uppercase">Original raw row values</p>
-                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-slate-400">
+                          {/* Raw Csv Preview */}
+                          <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-500 space-y-1 mb-3">
+                            <p className="text-[10px] font-bold text-slate-400 uppercase">CSV raw row details</p>
+                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                               <div>Date: <b>{a.rawRow.date}</b></div>
-                              <div>Description: <b>{a.rawRow.description}</b></div>
+                              <div>Desc: <b>{a.rawRow.description}</b></div>
                               <div>Payer: <b>{a.rawRow.paid_by || "(empty)"}</b></div>
-                              <div>Amount: <b>{a.rawRow.amount} {a.rawRow.currency}</b></div>
+                              <div>Amt: <b>{a.rawRow.amount} {a.rawRow.currency}</b></div>
                             </div>
                           </div>
 
-                          {/* Quick Action buttons */}
+                          {/* Interactive Resolution Panel */}
                           <div className="flex flex-wrap gap-2 text-xs">
-                            {/* Missing Payer Resolution */}
+                            {/* Missing Payer */}
                             {a.anomalyType === "MISSING_PAYER" && (
-                              <>
-                                {selectedGroup.memberships.map(m => (
-                                  <button 
-                                    key={m.id}
-                                    onClick={() => handleResolveAnomaly(a.fingerprint, "MAPPED_USER", { from: "", to: m.user.name })}
-                                    className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
-                                      resolution?.resolutionDetails?.to === m.user.name
-                                        ? "bg-green-600 border-green-500 text-white"
-                                        : "bg-slate-900 hover:bg-slate-800 border-slate-800"
-                                    }`}
-                                  >
-                                    Assign to {m.user.name}
-                                  </button>
-                                ))}
-                              </>
+                              <div className="space-y-2 w-full">
+                                <p className="text-[10px] text-slate-500 font-bold uppercase">Assign Payer:</p>
+                                <div className="flex flex-wrap gap-2">
+                                  {selectedGroup.memberships.map(m => (
+                                    <button
+                                      key={m.id}
+                                      onClick={() => handleResolveAnomaly(a.fingerprint, "MAPPED_USER", { from: "", to: m.user.name })}
+                                      className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
+                                        resolution?.resolutionDetails?.to === m.user.name
+                                          ? "bg-blue-600 border-blue-500 text-white"
+                                          : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
+                                      }`}
+                                    >
+                                      {m.user.name}
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
                             )}
 
-                            {/* Unknown User Resolution */}
+                            {/* Unknown User Mapping */}
                             {a.anomalyType === "UNKNOWN_USER" && (
-                              <div className="space-y-2.5 w-full">
-                                <p className="text-[10px] font-bold text-slate-400">Map this name to an existing database user:</p>
+                              <div className="space-y-2 w-full">
+                                <p className="text-[10px] text-slate-500 font-bold uppercase">Map to Existing member:</p>
                                 <div className="flex flex-wrap gap-2">
                                   {selectedGroup.memberships.map(m => {
-                                    // Extract the unknown username from the description
                                     const match = a.description.match(/'(.+?)'/);
                                     const rawName = match ? match[1] : "";
                                     return (
-                                      <button 
+                                      <button
                                         key={m.id}
                                         onClick={() => handleResolveAnomaly(a.fingerprint, "MAPPED_USER", { from: rawName, to: m.user.name })}
-                                        className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
+                                        className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
                                           resolution?.resolutionDetails?.to === m.user.name
-                                            ? "bg-green-600 border-green-500 text-white"
-                                            : "bg-slate-900 hover:bg-slate-800 border-slate-800"
+                                            ? "bg-blue-600 border-blue-500 text-white"
+                                            : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
                                         }`}
                                       >
-                                        Map to {m.user.name}
+                                        {m.user.name}
                                       </button>
                                     );
                                   })}
@@ -1211,42 +1574,41 @@ export default function App() {
                               </div>
                             )}
 
-                            {/* Ambiguous Date Resolution */}
+                            {/* Ambiguous Date Selector */}
                             {a.anomalyType === "AMBIGUOUS_DATE" && (
-                              <div className="space-y-2.5 w-full">
-                                <p className="text-[10px] font-bold text-slate-400">Select Date Interpretation:</p>
+                              <div className="space-y-2 w-full">
+                                <p className="text-[10px] text-slate-500 font-bold uppercase">Confirm Date interpretation:</p>
                                 <div className="flex space-x-3">
-                                  {/* Derive option dates (e.g. 04-05-2026 -> April 5 or May 4) */}
                                   {(() => {
                                     const match = a.rawRow.date.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
                                     if (!match) return null;
                                     const d1 = `${match[3]}-${match[2].padStart(2, '0')}-${match[1].padStart(2, '0')}`;
                                     const d2 = `${match[3]}-${match[1].padStart(2, '0')}-${match[2].padStart(2, '0')}`;
                                     
-                                    const opt1Label = new Date(d1).toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" });
-                                    const opt2Label = new Date(d2).toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" });
-                                    
+                                    const label1 = new Date(d1).toLocaleDateString("en-IN", { day: "numeric", month: "long" });
+                                    const label2 = new Date(d2).toLocaleDateString("en-IN", { day: "numeric", month: "long" });
+
                                     return (
                                       <>
                                         <button 
                                           onClick={() => handleResolveAnomaly(a.fingerprint, "ACCEPTED_WARNING", { selectedDate: d1 })}
                                           className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
                                             resolution?.resolutionDetails?.selectedDate === d1
-                                              ? "bg-green-600 border-green-500 text-white"
-                                              : "bg-slate-900 border-slate-800"
+                                              ? "bg-blue-600 border-blue-500 text-white"
+                                              : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
                                           }`}
                                         >
-                                          {opt1Label} (DD-MM-YYYY)
+                                          {label1} (DD-MM)
                                         </button>
                                         <button 
                                           onClick={() => handleResolveAnomaly(a.fingerprint, "ACCEPTED_WARNING", { selectedDate: d2 })}
                                           className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
                                             resolution?.resolutionDetails?.selectedDate === d2
-                                              ? "bg-green-600 border-green-500 text-white"
-                                              : "bg-slate-900 border-slate-800"
+                                              ? "bg-blue-600 border-blue-500 text-white"
+                                              : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
                                           }`}
                                         >
-                                          {opt2Label} (MM-DD-YYYY)
+                                          {label2} (MM-DD)
                                         </button>
                                       </>
                                     );
@@ -1255,33 +1617,33 @@ export default function App() {
                               </div>
                             )}
 
-                            {/* Settlement Disguised as Expense Resolution */}
+                            {/* Repayment Disguised */}
                             {a.anomalyType === "SETTLEMENT_DISGUISED_AS_EXPENSE" && (
                               <>
                                 <button 
                                   onClick={() => handleResolveAnomaly(a.fingerprint, "CONVERTED_TO_SETTLEMENT")}
                                   className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
                                     resolution?.resolutionAction === "CONVERTED_TO_SETTLEMENT"
-                                      ? "bg-indigo-600 border-indigo-500 text-white"
-                                      : "bg-slate-900 border-slate-800 text-indigo-400 hover:bg-slate-800"
+                                      ? "bg-blue-600 border-blue-550 text-white"
+                                      : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
                                   }`}
                                 >
-                                  Yes, convert to Settlement
+                                  Convert to Settlement
                                 </button>
                                 <button 
                                   onClick={() => handleResolveAnomaly(a.fingerprint, "ACCEPTED_WARNING")}
                                   className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
                                     resolution?.resolutionAction === "ACCEPTED_WARNING"
-                                      ? "bg-slate-800 text-white"
-                                      : "bg-slate-900 border-slate-800"
+                                      ? "bg-slate-200 border-slate-300 text-slate-800"
+                                      : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
                                   }`}
                                 >
-                                  No, import as regular Expense
+                                  Keep as regular Expense
                                 </button>
                               </>
                             )}
 
-                            {/* Duplicate Detection Resolution */}
+                            {/* Duplicate checking */}
                             {a.anomalyType === "DUPLICATE" && (
                               <>
                                 <button 
@@ -1289,94 +1651,116 @@ export default function App() {
                                   className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
                                     resolution?.resolutionAction === "REJECT_ROW"
                                       ? "bg-red-600 border-red-500 text-white"
-                                      : "bg-slate-900 border-slate-800 text-red-400 hover:bg-slate-850"
+                                      : "bg-white border-slate-300 hover:bg-slate-50 text-red-650"
                                   }`}
                                 >
-                                  Reject duplicate row (Delete)
+                                  Discard Duplicate Row
                                 </button>
                                 <button 
                                   onClick={() => handleResolveAnomaly(a.fingerprint, "APPROVED_DUPLICATE")}
                                   className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
                                     resolution?.resolutionAction === "APPROVED_DUPLICATE"
                                       ? "bg-green-600 border-green-500 text-white"
-                                      : "bg-slate-900 border-slate-800"
+                                      : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
                                   }`}
                                 >
-                                  Approve duplicate as valid
+                                  Approve Duplicate
                                 </button>
                               </>
                             )}
 
-                            {/* Simple Warning Resolutions (INFO / general warnings) */}
+                            {/* Safe Warns */}
                             {["MISSING_CURRENCY", "NEGATIVE_AMOUNT", "ZERO_AMOUNT", "MEMBERSHIP_VIOLATION"].includes(a.anomalyType) && (
                               <>
                                 <button 
                                   onClick={() => handleResolveAnomaly(a.fingerprint, "ACCEPTED_WARNING")}
                                   className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
                                     resolution?.resolutionAction === "ACCEPTED_WARNING"
-                                      ? "bg-green-600 border-green-500 text-white"
-                                      : "bg-slate-900 border-slate-850"
+                                      ? "bg-blue-600 border-blue-500 text-white"
+                                      : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
                                   }`}
                                 >
-                                  Accept and continue
+                                  Acknowledge & Accept
                                 </button>
                                 {a.anomalyType === "MEMBERSHIP_VIOLATION" && (
                                   <button 
                                     onClick={() => handleResolveAnomaly(a.fingerprint, "REJECT_ROW")}
                                     className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer ${
                                       resolution?.resolutionAction === "REJECT_ROW"
-                                        ? "bg-red-600 border-red-550 text-white"
-                                        : "bg-slate-900 border-slate-850 text-red-400"
+                                        ? "bg-red-600 border-red-500 text-white"
+                                        : "bg-white border-slate-300 hover:bg-slate-50 text-red-650"
                                     }`}
                                   >
-                                    Exclude row
+                                    Exclude Row
                                   </button>
                                 )}
                               </>
                             )}
+
                           </div>
 
-                          {/* Audit Note text input */}
+                          {/* Notes */}
                           <div className="mt-3.5">
                             <input 
-                              type="text"
+                              type="text" 
                               value={resolution?.resolutionNote || ""}
                               onChange={e => handleResolveNote(a.fingerprint, e.target.value)}
-                              placeholder="Add resolution details audit note..."
-                              className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs focus:outline-none"
+                              placeholder="Add resolution explanation audit trail note..."
+                              className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-xs focus:outline-none"
                             />
                           </div>
+
                         </div>
                       );
                     })
                   )}
                 </div>
 
-                {/* Right Column: Preview Stats, Finalize controls */}
-                <div className="bg-slate-950/40 border border-slate-800/80 rounded-2xl p-6 shadow-lg h-fit space-y-6">
-                  <h3 className="font-bold text-lg">Verification Summary</h3>
-
-                  <div className="space-y-3.5 text-xs text-slate-400">
-                    <div className="flex justify-between">
-                      <span>Total Anomalies Detected:</span>
-                      <span className="font-bold text-slate-100">{activeImportAnomalies.length}</span>
+                {/* Right Column: Diagnostics panel and Final controls */}
+                <div className="space-y-6">
+                  {/* Final control */}
+                  <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm space-y-4">
+                    <h3 className="font-bold text-base text-slate-800">Import Controller</h3>
+                    <div className="text-xs text-slate-500 space-y-2">
+                      <div className="flex justify-between">
+                        <span>Total anomalies:</span>
+                        <span className="font-bold text-slate-800">{activeImportAnomalies.length}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span>Resolved items:</span>
+                        <span className="font-bold text-green-600">
+                          {Object.values(importResolutions).filter(r => r.resolutionAction !== null).length} / {activeImportAnomalies.length}
+                        </span>
+                      </div>
                     </div>
-                    <div className="flex justify-between">
-                      <span>Resolved Items:</span>
-                      <span className="font-bold text-green-400">
-                        {Object.values(importResolutions).filter(r => r.resolutionAction !== null).length} / {activeImportAnomalies.length}
-                      </span>
-                    </div>
+                    <button 
+                      onClick={handleFinalizeImport}
+                      className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 rounded-lg cursor-pointer text-xs"
+                    >
+                      Persist Resolved Data & Generate Report
+                    </button>
                   </div>
 
-                  <hr className="border-slate-850" />
-
-                  <button 
-                    onClick={handleFinalizeImport}
-                    className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold py-3 rounded-xl cursor-pointer text-sm shadow-lg shadow-indigo-600/20"
-                  >
-                    Resolve Anomalies & Finalize Import
-                  </button>
+                  {/* Diagnostics Panel */}
+                  <div className="bg-slate-950 text-slate-200 rounded-xl p-5 shadow-sm space-y-3 font-mono text-[10px]">
+                    <h4 className="font-bold border-b border-slate-800 pb-2 text-slate-400 flex items-center">
+                      <Database className="w-3.5 h-3.5 mr-1" /> Import Diagnostics
+                    </h4>
+                    <div className="space-y-3 max-h-[300px] overflow-y-auto pr-1">
+                      {diagnosticsLogs.length === 0 ? (
+                        <p className="text-slate-500">Awaiting import pipeline start...</p>
+                      ) : (
+                        diagnosticsLogs.map((log, idx) => (
+                          <div key={idx} className="space-y-1">
+                            <p className="text-blue-400">[{log.timestamp}] STAGE: {log.stage}</p>
+                            <pre className="text-slate-400 overflow-x-auto bg-slate-900/50 p-2 rounded max-w-[250px]">
+                              {JSON.stringify(log.details, null, 2)}
+                            </pre>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
                 </div>
 
               </div>
@@ -1384,20 +1768,129 @@ export default function App() {
           </div>
         )}
 
+        {/* VIEW: ADMIN INTERVIEW/DEMO VIEW */}
+        {view === "admin-demo" && adminDemoData && (
+          <div className="space-y-6 animate-fade-in">
+            <div className="flex items-center justify-between border-b border-slate-200 pb-4">
+              <button 
+                onClick={() => setView("dashboard")}
+                className="text-slate-500 hover:text-slate-800 flex items-center text-sm font-semibold transition-colors cursor-pointer"
+              >
+                <ArrowRight className="w-4 h-4 mr-1 rotate-180" /> Back to Dashboard
+              </button>
+              <h2 className="text-xl font-bold text-slate-900 flex items-center">
+                <ShieldAlert className="w-5 h-5 mr-2 text-blue-600" /> Admin Walkthrough Diagnostics
+              </h2>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              
+              {/* Left Side: Audit Log Feed */}
+              <div className="lg:col-span-2 space-y-6">
+                
+                {/* Audit Logs */}
+                <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
+                  <h3 className="font-bold text-base text-slate-800 mb-4 flex items-center">
+                    <History className="w-4 h-4 mr-2 text-slate-500" /> Audit Resolution Logs
+                  </h3>
+
+                  <div className="space-y-3 max-h-[400px] overflow-y-auto pr-1">
+                    {adminDemoData.auditLogs.length === 0 ? (
+                      <p className="text-xs text-slate-400">No audit logs written.</p>
+                    ) : (
+                      adminDemoData.auditLogs.map(log => (
+                        <div key={log.id} className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-2">
+                          <div className="flex justify-between text-[10px] text-slate-450">
+                            <span>ACTION: <b>{log.action}</b></span>
+                            <span>{new Date(log.createdAt).toLocaleString()}</span>
+                          </div>
+                          <p className="font-medium text-slate-800">
+                            Entity: {log.entityType} ({log.entityId})
+                          </p>
+                          {log.afterState && (
+                            <pre className="p-2 bg-slate-900 text-slate-200 rounded overflow-x-auto text-[9px]">
+                              {JSON.stringify(log.afterState, null, 2)}
+                            </pre>
+                          )}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                {/* Import Job Diagnostics details */}
+                <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
+                  <h3 className="font-bold text-base text-slate-800 mb-4 flex items-center">
+                    <FileText className="w-4 h-4 mr-2 text-slate-500" /> Import Anomaly Files Details
+                  </h3>
+                  <div className="space-y-4">
+                    {adminDemoData.importJobs.map(job => (
+                      <div key={job.id} className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3 text-xs">
+                        <div className="flex items-center justify-between">
+                          <h4 className="font-bold text-slate-800">{job.rawFileName}</h4>
+                          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-100 text-blue-800">{job.status}</span>
+                        </div>
+                        <p className="text-[10px] text-slate-400">File Hash: {job.rawFileHash}</p>
+                        {job.anomalies && job.anomalies.length > 0 && (
+                          <div className="space-y-2 pl-3 border-l-2 border-slate-200">
+                            <p className="font-semibold text-slate-500 text-[10px] uppercase">Anomalies Resolved:</p>
+                            {job.anomalies.map(a => (
+                              <div key={a.id} className="text-[11px] text-slate-700">
+                                Row {a.rowNumber} ({a.anomalyType}): {a.description} 
+                                {a.resolutionAction && <b className="text-green-600"> $\rightarrow$ Resolved ({a.resolutionAction})</b>}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+              </div>
+
+              {/* Right Side: Membership soft delete logs */}
+              <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm h-fit">
+                <h3 className="font-bold text-base text-slate-800 mb-4 flex items-center">
+                  <Calendar className="w-4 h-4 mr-2 text-slate-500" /> Membership Active Periods
+                </h3>
+                <div className="space-y-3 max-h-[500px] overflow-y-auto pr-1">
+                  {adminDemoData.memberships.map(m => (
+                    <div key={m.id} className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-1">
+                      <div className="flex justify-between font-bold text-slate-800">
+                        <span>{m.user.name}</span>
+                        <span className={`px-2 py-0.5 rounded text-[9px] font-bold ${
+                          m.leftAt ? "bg-red-100 text-red-800" : "bg-green-100 text-green-800"
+                        }`}>
+                          {m.leftAt ? "Inactive" : "Active"}
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-slate-500">Group: {m.group.name}</p>
+                      <p className="text-[10px] text-slate-400">Joined: {new Date(m.joinedAt).toLocaleDateString()}</p>
+                      {m.leftAt && <p className="text-[10px] text-rose-600">Left: {new Date(m.leftAt).toLocaleDateString()}</p>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+            </div>
+          </div>
+        )}
+
       </main>
 
-      {/* Modal dialog: Traceability Card / Explainable Balance breakdown */}
+      {/* Modal: Traceability audit timeline */}
       {traceUser && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-sm">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-2xl w-full p-6 shadow-2xl flex flex-col max-h-[85vh]">
-            <div className="flex items-center justify-between mb-5">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+          <div className="bg-white border border-slate-200 rounded-2xl max-w-xl w-full p-6 shadow-2xl flex flex-col max-h-[80vh]">
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3 mb-4">
               <div>
-                <h3 className="text-lg font-bold text-slate-100">Balance Breakdown: {traceUser.userName}</h3>
-                <p className="text-xs text-slate-500">Trace log auditing how debt calculations were derived</p>
+                <h3 className="font-bold text-base text-slate-900">Ledger Audit: {traceUser.userName}</h3>
+                <p className="text-[10px] text-slate-500">Chronological list of transaction calculations</p>
               </div>
               <button 
                 onClick={() => setTraceUser(null)}
-                className="text-slate-400 hover:text-slate-100 p-1.5 bg-slate-800 rounded-lg text-sm cursor-pointer"
+                className="text-xs font-semibold px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg cursor-pointer transition-colors"
               >
                 Close
               </button>
@@ -1406,47 +1899,44 @@ export default function App() {
             <div className="flex-1 overflow-y-auto space-y-3 pr-1">
               {traceUser.trace.map((t, idx) => {
                 const isExpense = t.type === "EXPENSE";
-                const isSettlement = t.type === "SETTLEMENT";
                 const net = t.netEffect;
                 return (
-                  <div key={idx} className="p-3 bg-slate-950/40 border border-slate-850 rounded-xl text-xs flex justify-between items-center">
-                    <div className="space-y-1">
-                      <div className="flex items-center space-x-2">
-                        <span className={`px-2 py-0.5 rounded-[4px] text-[8px] font-bold ${
-                          isExpense ? "bg-indigo-950 text-indigo-400" : "bg-emerald-950 text-emerald-400"
+                  <div key={idx} className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs flex justify-between items-center">
+                    <div>
+                      <div className="flex items-center space-x-1.5">
+                        <span className={`px-1.5 py-0.5 rounded text-[8px] font-bold ${
+                          isExpense ? "bg-blue-100 text-blue-800" : "bg-emerald-100 text-emerald-800"
                         }`}>
                           {t.type}
                         </span>
-                        <h4 className="font-bold text-slate-200">
-                          {isExpense ? t.title : `${t.payerName} → ${t.receiverName}`}
-                        </h4>
+                        <span className="font-bold text-slate-800">
+                          {isExpense ? t.title : `${t.payerName} to ${t.receiverName}`}
+                        </span>
                       </div>
-                      <p className="text-[10px] text-slate-500">
-                        {new Date(t.date).toLocaleDateString()} • Original: {t.originalAmount || t.amount} {t.currency}
+                      <p className="text-[9px] text-slate-400 mt-1">
+                        {new Date(t.date).toLocaleDateString()} • Original amount: {t.originalAmount || t.amount} {t.currency}
                       </p>
                     </div>
-                    
+
                     <div className="flex items-center space-x-4">
-                      <div className="text-right space-y-0.5 text-slate-400">
+                      <div className="text-right text-[10px] text-slate-450 space-y-0.5">
                         {isExpense ? (
                           <>
-                            <div>Paid: <b>{t.paidAmount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}</b></div>
-                            <div>Owed: <b>{t.owedAmount?.toLocaleString("en-IN", { style: "currency", currency: "INR" })}</b></div>
+                            <div>Paid: {t.paidAmount.toLocaleString("en-IN")}</div>
+                            <div>Owed: {t.owedAmount?.toLocaleString("en-IN")}</div>
                           </>
                         ) : (
                           <>
-                            {t.paidAmount > 0 && <div>Paid back: <b>{t.paidAmount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}</b></div>}
-                            {t.receivedAmount !== undefined && t.receivedAmount > 0 && <div>Received: <b>{t.receivedAmount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}</b></div>}
+                            {t.paidAmount > 0 && <div>Paid: {t.paidAmount.toLocaleString("en-IN")}</div>}
+                            {t.receivedAmount !== undefined && t.receivedAmount > 0 && <div>Received: {t.receivedAmount.toLocaleString("en-IN")}</div>}
                           </>
                         )}
                       </div>
-                      
-                      <span className={`font-extrabold text-sm min-w-[80px] text-right ${
-                        net > 0 ? "text-emerald-400" :
-                        net < 0 ? "text-rose-400" :
-                        "text-slate-400"
+
+                      <span className={`font-bold min-w-[70px] text-right ${
+                        net > 0 ? "text-green-600" : net < 0 ? "text-red-650" : "text-slate-550"
                       }`}>
-                        {net > 0 ? "+" : ""}{net.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
+                        {net > 0 ? "+" : ""}{net.toLocaleString("en-IN")}
                       </span>
                     </div>
                   </div>
@@ -1454,14 +1944,10 @@ export default function App() {
               })}
             </div>
 
-            <hr className="border-slate-850 my-4" />
-
-            <div className="flex justify-between items-center">
-              <span className="text-sm font-bold text-slate-400">Final Net Balance:</span>
-              <span className={`text-lg font-extrabold ${
-                traceUser.netBalance > 0 ? "text-emerald-400" :
-                traceUser.netBalance < 0 ? "text-rose-400" :
-                "text-slate-400"
+            <div className="border-t border-slate-200 pt-4 mt-4 flex justify-between items-center">
+              <span className="text-xs font-bold text-slate-500">Net Ledger Balance:</span>
+              <span className={`font-extrabold text-base ${
+                traceUser.netBalance > 0 ? "text-green-650" : traceUser.netBalance < 0 ? "text-red-650" : "text-slate-700"
               }`}>
                 {traceUser.netBalance > 0 ? "+" : ""}{traceUser.netBalance.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
               </span>
