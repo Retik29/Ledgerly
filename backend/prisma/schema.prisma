@@ -1,6 +1,6 @@
 datasource db {
-  provider = "sqlite"
-  url      = "file:./dev.db"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 generator client {
@@ -8,7 +8,7 @@ generator client {
 }
 
 model User {
-  id           String            @id @default(uuid())
+  id           String            @id @default(uuid()) @db.Uuid
   name         String
   email        String            @unique
   passwordHash String
@@ -24,9 +24,9 @@ model User {
 }
 
 model Group {
-  id        String   @id @default(uuid())
+  id        String   @id @default(uuid()) @db.Uuid
   name      String
-  createdBy String
+  createdBy String   @db.Uuid
   createdAt DateTime @default(now())
   
   // Relations
@@ -38,9 +38,9 @@ model Group {
 }
 
 model GroupMembership {
-  id       String    @id @default(uuid())
-  groupId  String
-  userId   String
+  id       String    @id @default(uuid()) @db.Uuid
+  groupId  String    @db.Uuid
+  userId   String    @db.Uuid
   joinedAt DateTime
   leftAt   DateTime?
   
@@ -52,15 +52,15 @@ model GroupMembership {
 }
 
 model Expense {
-  id               String               @id @default(uuid())
-  groupId          String
+  id               String               @id @default(uuid()) @db.Uuid
+  groupId          String               @db.Uuid
   title            String
   description      String?
   amount           Float
   currency         String               @default("INR")
   exchangeRate     Float                @default(1.0)
   normalizedAmount Float
-  paidBy           String
+  paidBy           String               @db.Uuid
   expenseDate      DateTime
   splitType        String               // equal, percentage, exact, share, weight
   imported         Boolean              @default(false)
@@ -77,9 +77,9 @@ model Expense {
 }
 
 model ExpenseParticipant {
-  id              String   @id @default(uuid())
-  expenseId       String
-  userId          String
+  id              String   @id @default(uuid()) @db.Uuid
+  expenseId       String   @db.Uuid
+  userId          String   @db.Uuid
   sharePercentage Float?
   shareAmount     Float
   shareWeight     Float?
@@ -92,10 +92,10 @@ model ExpenseParticipant {
 }
 
 model Settlement {
-  id             String    @id @default(uuid())
-  groupId        String
-  payerId        String
-  receiverId     String
+  id             String    @id @default(uuid()) @db.Uuid
+  groupId        String    @db.Uuid
+  payerId        String    @db.Uuid
+  receiverId     String    @db.Uuid
   amount         Float
   currency       String    @default("INR")
   settlementDate DateTime
@@ -109,8 +109,8 @@ model Settlement {
 }
 
 model ImportJob {
-  id           String          @id @default(uuid())
-  groupId      String?
+  id           String          @id @default(uuid()) @db.Uuid
+  groupId      String?         @db.Uuid
   rawFileName  String
   rawFileHash  String
   status       String          // UPLOADED, ANALYZING, REVIEW_REQUIRED, APPROVED, IMPORTING, COMPLETED, FAILED
@@ -125,8 +125,8 @@ model ImportJob {
 }
 
 model ImportAnomaly {
-  id                String    @id @default(uuid())
-  importJobId       String
+  id                String    @id @default(uuid()) @db.Uuid
+  importJobId       String    @db.Uuid
   rowNumber         Int
   fingerprint       String
   severity          String    // INFO, WARNING, ERROR, BLOCKING
@@ -135,7 +135,7 @@ model ImportAnomaly {
   rawRow            String    // Stored as stringified JSON
   normalizedRow     String?   // Stored as stringified JSON
   status            String    @default("PENDING") // PENDING, APPROVED, REJECTED, RESOLVED
-  resolvedBy        String?
+  resolvedBy        String?   @db.Uuid
   resolvedAt        DateTime?
   resolutionNote    String?
   policyType        String?   // DUPLICATE, CURRENCY, SETTLEMENT, MEMBERSHIP
@@ -147,11 +147,11 @@ model ImportAnomaly {
 }
 
 model AuditLog {
-  id          String   @id @default(uuid())
+  id          String   @id @default(uuid()) @db.Uuid
   entityType  String
-  entityId    String
+  entityId    String   @db.Uuid
   action      String
-  performedBy String?
+  performedBy String?  @db.Uuid
   beforeState String?  // Stored as stringified JSON
   afterState  String?  // Stored as stringified JSON
   createdAt   DateTime @default(now())
