@@ -353,10 +353,10 @@ JWT_SECRET="super-secret-shared-expense-manager-key-2026"
 
 ## Screenshots Placeholders
 *Dashboard View*
-![Dashboard Screenshot Placeholder](https://via.placeholder.com/800x450.png?text=Ledgerly+Dashboard+View)
+![Dashboard Screenshot Placeholder](![Dashboard Screenshot](dashboard.png))
 
 *Review Queue Panel*
-![Review Queue Screenshot Placeholder](https://via.placeholder.com/800x450.png?text=Ledgerly+Review+Queue+Panel)
+![Review Queue Screenshot Placeholder](![Review Screenshot](image.png))
 
 ## License
 Distributed under the MIT License.
