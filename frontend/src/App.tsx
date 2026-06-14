@@ -380,10 +380,18 @@ export default function App() {
   const handleCreateGroup = async () => {
     if (!newGroupName.trim()) return;
     try {
-      await api.post("/groups", { name: newGroupName });
+      const res = await api.post("/groups", { name: newGroupName });
+      const createdGroup = res.data;
       setNewGroupName("");
       showToast("Group created successfully", "success");
-      fetchGroups();
+      await fetchGroups();
+
+      if (createdGroup && createdGroup.id) {
+        setSelectedGroupId(createdGroup.id);
+        await fetchGroupDetails(createdGroup.id);
+        setGroupTab("overview");
+        setView("group-detail");
+      }
     } catch (err) {
       console.error(err);
       showToast("Failed to create group", "error");
@@ -1208,7 +1216,10 @@ export default function App() {
                   <h3 className="font-semibold text-sm text-slate-800 flex items-center">
                     <Users className="w-4 h-4 mr-2 text-slate-400" strokeWidth={1.5} /> Reconciliation accounts
                   </h3>
-                  <div className="flex space-x-2">
+                  <form 
+                    onSubmit={e => { e.preventDefault(); handleCreateGroup(); }}
+                    className="flex space-x-2"
+                  >
                     <input 
                       type="text" 
                       value={newGroupName}
@@ -1217,12 +1228,12 @@ export default function App() {
                       placeholder="New group name..."
                     />
                     <button 
-                      onClick={handleCreateGroup}
+                      type="submit"
                       className="bg-blue-600 hover:bg-blue-700 text-white px-3.5 py-1.5 text-xs rounded-lg font-semibold transition-colors shadow-sm cursor-pointer"
                     >
                       Create
                     </button>
-                  </div>
+                  </form>
                 </div>
 
                 {loadingGroups ? (

@@ -36,6 +36,17 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
         }
       });
 
+      // Write to audit log
+      await tx.auditLog.create({
+        data: {
+          entityType: "GROUP",
+          entityId: newGroup.id,
+          action: "CREATE",
+          performedBy: creatorId,
+          afterState: JSON.stringify(newGroup)
+        }
+      });
+
       return newGroup;
     });
 
