@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from "react";
 import { api } from "./services/api";
 import { 
   Users, Plus, Upload, Trash2, ArrowRight, UserCheck, AlertTriangle, AlertOctagon, 
-  CheckCircle, ArrowLeftRight, HelpCircle, LogOut, Check, RefreshCw, Info, Calendar, FileText,
+  CheckCircle, ArrowLeftRight, ArrowRightLeft, Receipt, HelpCircle, LogOut, Check, RefreshCw, Info, Calendar, FileText,
   Search, Eye, ShieldAlert, History, Activity, Database, CheckSquare, Layers,
   UploadCloud, CreditCard, Clock, ArrowUpRight, ArrowDownRight, Sparkles, FileSpreadsheet
 } from "lucide-react";
@@ -235,6 +235,7 @@ export default function App() {
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importStats, setImportStats] = useState<any | null>(null);
   const [importError, setImportError] = useState("");
+  const [duplicateBatchError, setDuplicateBatchError] = useState<{ jobId: string; message: string } | null>(null);
 
   // Diagnostics Panel Stage Logging
   const [diagnosticsLogs, setDiagnosticsLogs] = useState<{ stage: string; timestamp: string; details: any }[]>([]);
@@ -551,9 +552,10 @@ export default function App() {
     showToast("Auto-resolved safe warnings", "success");
   };
 
-  const handleUploadCsv = async () => {
+  const handleUploadCsv = async (mode: string = "PRODUCTION") => {
     if (!importFile || !importCsvContent || !selectedGroupId) return;
     setImportError("");
+    setDuplicateBatchError(null);
     setImportStats(null);
     setDiagnosticsLogs([]); 
     setImportStartTime(Date.now());
@@ -561,7 +563,7 @@ export default function App() {
     
     // Step 2: Parsing
     setImportStep(2);
-    addDiagnosticsLog("REQUEST_VALIDATION", { filename: importFile.name, size: importFile.size });
+    addDiagnosticsLog("REQUEST_VALIDATION", { filename: importFile.name, size: importFile.size, mode });
 
     try {
       // Small simulated delay for premium UX
@@ -575,7 +577,8 @@ export default function App() {
       const res = await api.post("/imports/upload", {
         filename: importFile.name,
         csvContent: importCsvContent,
-        groupId: selectedGroupId
+        groupId: selectedGroupId,
+        mode
       });
 
       addDiagnosticsLog("ANOMALY_ENGINE", {
@@ -605,6 +608,11 @@ export default function App() {
       setImportStep(4);
     } catch (err: any) {
       const errData = err.response?.data;
+      if (errData && errData.error === "DUPLICATE_BATCH") {
+        setDuplicateBatchError({ jobId: errData.jobId, message: errData.message });
+        setImportStep(2); // Keep stepper at Parsing stage but show duplicate card
+        return;
+      }
       addDiagnosticsLog(errData?.stage || "SERVER_CRASH", { error: errData?.message || err.message });
       setImportError(errData?.message || "Failed to analyze CSV file.");
       setImportStep(1);
@@ -657,6 +665,28 @@ export default function App() {
       return;
     }
 
+    // Check if any split anomaly has an invalid sum
+    const invalidSplit = activeImportAnomalies.some(a => {
+      const res = importResolutions[a.fingerprint];
+      if (res && res.resolutionAction === "CORRECTED_PERCENT_SPLIT") {
+        const details = (res.resolutionDetails?.correctedSplitDetails || {}) as Record<string, number>;
+        if (Object.keys(details).length === 0) return true;
+        const sum = Object.values(details).reduce((x: number, y: number) => x + y, 0);
+        if (a.anomalyType === "INVALID_PERCENT_SPLIT") {
+          return Math.abs(sum - 100) > 0.01;
+        } else if (a.anomalyType === "INVALID_EXACT_SPLIT") {
+          const total = a.normalizedRow.originalAmount || 0;
+          return Math.abs(sum - total) > 0.01;
+        }
+      }
+      return false;
+    });
+
+    if (invalidSplit) {
+      showToast("One or more split adjustments are invalid. The sum must match exactly 100% (or the total amount).", "warning");
+      return;
+    }
+
     // Step 5: Finalizing
     setImportStep(5);
     try {
@@ -685,6 +715,78 @@ export default function App() {
       setImportStep(4); // Back to review queue
     }
   };
+
+  // Memoized dynamic audit log timeline for financial audit ledger representation
+  const dynamicTimeline = useMemo(() => {
+    const events: { id: string; date: string; title: string; category: string; user: string; amount?: number }[] = [];
+    
+    groups.forEach(g => {
+      const groupExpenses = (g as any).expenses || [];
+      groupExpenses.forEach((e: any) => {
+        events.push({
+          id: `exp-${e.id}`,
+          date: e.expenseDate || e.createdAt,
+          title: `Expense created: "${e.title}"`,
+          category: "Expense",
+          user: e.payer?.name || "Member",
+          amount: e.normalizedAmount
+        });
+      });
+      
+      const groupSettlements = (g as any).settlements || [];
+      groupSettlements.forEach((s: any) => {
+        events.push({
+          id: `settle-${s.id}`,
+          date: s.settlementDate || s.createdAt,
+          title: `Settlement recorded: ${s.payer?.name} repaid ${s.receiver?.name}`,
+          category: "Settlement",
+          user: s.payer?.name || "Member",
+          amount: s.amount
+        });
+      });
+    });
+
+    importJobs.forEach(j => {
+      events.push({
+        id: `job-${j.id}`,
+        date: j.uploadedAt,
+        title: `CSV ledger reconciliation sheet "${j.rawFileName}" uploaded`,
+        category: "Import",
+        user: "System",
+        amount: j.summary?.rowsProcessed || 0
+      });
+    });
+
+    if (selectedGroupId && selectedGroup) {
+      expenses.forEach(e => {
+        if (!events.some(evt => evt.id === `exp-${e.id}`)) {
+          events.push({
+            id: `exp-${e.id}`,
+            date: e.expenseDate,
+            title: `Expense created: "${e.title}"`,
+            category: "Expense",
+            user: e.payer?.name || "Member",
+            amount: e.normalizedAmount
+          });
+        }
+      });
+      settlements.forEach(s => {
+        if (!events.some(evt => evt.id === `settle-${s.id}`)) {
+          events.push({
+            id: `settle-${s.id}`,
+            date: s.settlementDate,
+            title: `Settlement recorded: ${s.payer?.name} repaid ${s.receiver?.name}`,
+            category: "Settlement",
+            user: s.payer?.name || "Member",
+            amount: s.amount
+          });
+        }
+      });
+    }
+
+    events.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    return events.slice(0, 10);
+  }, [groups, importJobs, selectedGroupId, selectedGroup, expenses, settlements]);
 
   // Memoized unminimized (raw) debts calculated directly from expenses and settlements
   const rawDebts = useMemo(() => {
@@ -807,8 +909,8 @@ export default function App() {
       )}
 
       {/* Header */}
-      <header className="border-b border-slate-200 bg-white sticky top-0 z-40 px-6 py-4 flex items-center justify-between shadow-sm">
-        <div className="flex items-center space-x-3 cursor-pointer" onClick={() => {
+      <header className="border-b border-slate-200 bg-white sticky top-0 z-40 px-6 py-3.5 flex items-center justify-between shadow-sm">
+        <div className="flex items-center space-x-2.5 cursor-pointer" onClick={() => {
           setView(token ? "dashboard" : "login");
           window.location.hash = "";
           setSelectedGroupId(null);
@@ -819,19 +921,18 @@ export default function App() {
           setImportResolutions({});
           setImportStats(null);
         }}>
-          <div className="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center text-white shadow-sm shrink-0">
-            <CreditCard className="w-5 h-5" strokeWidth={1.5} />
+          <div className="w-8 h-8 rounded-lg bg-blue-50 border border-blue-100 flex items-center justify-center text-blue-600 shrink-0">
+            <CreditCard className="w-4 h-4" strokeWidth={1.5} />
           </div>
           <div>
-            <h1 className="font-extrabold text-lg tracking-tight text-slate-900">Ledgerly</h1>
-            <p className="text-[10px] text-slate-500 font-medium">Fintech-grade expense reconciliation</p>
+            <h1 className="font-bold text-base tracking-tight text-slate-950">Ledgerly</h1>
           </div>
         </div>
         
         <div className="flex items-center space-x-4">
           {currentUser && groups.length > 0 && (
             <div className="hidden md:flex items-center space-x-2">
-              <span className="text-[11px] font-bold text-slate-400">Active Group:</span>
+              <span className="text-xs font-medium text-slate-500">Active group:</span>
               <select 
                 value={selectedGroupId || ""}
                 onChange={(e) => {
@@ -847,9 +948,9 @@ export default function App() {
                     setView("group-detail");
                   }
                 }}
-                className="bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-650 cursor-pointer"
+                className="bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-600 transition-colors cursor-pointer"
               >
-                <option value="">Dashboard Overview</option>
+                <option value="">Dashboard overview</option>
                 {groups.map(g => (
                   <option key={g.id} value={g.id}>{g.name}</option>
                 ))}
@@ -861,18 +962,23 @@ export default function App() {
             <>
               <button 
                 onClick={() => { setView("admin-demo"); window.location.hash = "#/admin/demo"; }}
-                className={`text-xs font-semibold px-3 py-1.5 rounded-lg border transition-all cursor-pointer flex items-center ${
+                className={`text-xs font-medium px-2.5 py-1.5 rounded-lg border transition-all cursor-pointer flex items-center ${
                   view === "admin-demo"
-                    ? "bg-blue-50 border-blue-200 text-blue-700 font-bold"
-                    : "bg-white border-slate-200 text-slate-655 hover:bg-slate-50"
+                    ? "bg-blue-50 border-blue-200 text-blue-700 font-semibold"
+                    : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
                 }`}
               >
-                <Layers className="w-3.5 h-3.5 mr-1" strokeWidth={1.5} /> Demo Mode
+                <Layers className="w-3.5 h-3.5 mr-1" strokeWidth={1.5} /> Demo mode
               </button>
-              <span className="text-xs font-medium text-slate-500">Hi, <b className="text-slate-900">{currentUser.name}</b></span>
+              <div className="flex items-center space-x-2 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-700">
+                <div className="w-5 h-5 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center font-bold text-[10px]">
+                  {currentUser.name[0].toUpperCase()}
+                </div>
+                <span className="text-slate-900">{currentUser.name}</span>
+              </div>
               <button 
                 onClick={handleLogout}
-                className="p-2 rounded-lg bg-slate-100 hover:bg-slate-200 hover:text-red-600 text-slate-550 transition-all cursor-pointer"
+                className="p-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 hover:text-red-600 text-slate-500 transition-all cursor-pointer"
                 title="Logout"
               >
                 <LogOut className="w-4 h-4" strokeWidth={1.5} />
@@ -887,204 +993,203 @@ export default function App() {
         
         {/* VIEW: LOGIN */}
         {view === "login" && (
-          <div className="max-w-md w-full mx-auto my-12 bg-white border border-slate-200 rounded-2xl p-8 shadow-sm">
-            <h2 className="text-2xl font-bold text-slate-900 text-center mb-1">Welcome Back</h2>
-            <p className="text-slate-500 text-sm text-center mb-8">Access your shared expenses and imports</p>
+          <div className="max-w-md w-full mx-auto my-16 bg-white border border-slate-200 rounded-xl p-8 shadow-sm">
+            <h2 className="text-xl font-semibold text-slate-950 text-center mb-1.5">Welcome back</h2>
+            <p className="text-slate-500 text-xs text-center mb-6 font-medium">Access your shared expenses and imports</p>
 
-            {authError && <div className="p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm mb-4">{authError}</div>}
+            {authError && <div className="p-3 bg-red-50 border border-red-200 text-red-600 rounded-lg text-xs font-medium mb-4">{authError}</div>}
 
             <div className="space-y-4">
               <div>
-                <label className="block text-xs font-semibold text-slate-500 mb-1 uppercase tracking-wider">Email</label>
+                <label className="block text-xs font-medium text-slate-500 mb-1.5">Email address</label>
                 <input 
                   type="email" 
                   value={authEmail} 
                   onChange={e => setAuthEmail(e.target.value)}
-                  className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600" 
+                  className="w-full bg-white border border-slate-200 rounded-lg px-3.5 py-2 text-xs font-medium focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600" 
                   placeholder="name@example.com"
                 />
               </div>
               <div>
-                <label className="block text-xs font-semibold text-slate-500 mb-1 uppercase tracking-wider">Password</label>
+                <label className="block text-xs font-medium text-slate-500 mb-1.5">Password</label>
                 <input 
                   type="password" 
                   value={authPassword} 
                   onChange={e => setAuthPassword(e.target.value)}
-                  className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
+                  className="w-full bg-white border border-slate-200 rounded-lg px-3.5 py-2 text-xs font-medium focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
                   placeholder="••••••••"
                 />
               </div>
               <button 
                 onClick={() => handleAuth("login")}
-                className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-xl transition-all shadow-sm mt-6 cursor-pointer"
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold py-2.5 rounded-lg transition-all shadow-sm mt-6 cursor-pointer"
               >
-                Log In
+                Log in
               </button>
             </div>
             
-            <p className="text-sm text-slate-500 text-center mt-6">
-              New here? <button onClick={() => { setView("register"); setAuthError(""); }} className="text-blue-600 hover:underline font-medium">Create an account</button>
+            <p className="text-xs text-slate-500 text-center mt-6">
+              New here? <button onClick={() => { setView("register"); setAuthError(""); }} className="text-blue-600 hover:underline font-semibold cursor-pointer">Create an account</button>
             </p>
           </div>
         )}
 
         {/* VIEW: REGISTER */}
         {view === "register" && (
-          <div className="max-w-md w-full mx-auto my-12 bg-white border border-slate-200 rounded-2xl p-8 shadow-sm">
-            <h2 className="text-2xl font-bold text-slate-900 text-center mb-1">Create Account</h2>
-            <p className="text-slate-500 text-sm text-center mb-8">Register to manage shared group accounts</p>
+          <div className="max-w-md w-full mx-auto my-16 bg-white border border-slate-200 rounded-xl p-8 shadow-sm">
+            <h2 className="text-xl font-semibold text-slate-950 text-center mb-1.5">Create account</h2>
+            <p className="text-slate-500 text-xs text-center mb-6 font-medium">Register to manage shared group accounts</p>
 
-            {authError && <div className="p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm mb-4">{authError}</div>}
+            {authError && <div className="p-3 bg-red-50 border border-red-200 text-red-600 rounded-lg text-xs font-medium mb-4">{authError}</div>}
 
             <div className="space-y-4">
               <div>
-                <label className="block text-xs font-semibold text-slate-500 mb-1 uppercase tracking-wider">Full Name</label>
+                <label className="block text-xs font-medium text-slate-500 mb-1.5">Full name</label>
                 <input 
                   type="text" 
                   value={authName} 
                   onChange={e => setAuthName(e.target.value)}
-                  className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600" 
+                  className="w-full bg-white border border-slate-200 rounded-lg px-3.5 py-2 text-xs font-medium focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600" 
                   placeholder="Aisha"
                 />
               </div>
               <div>
-                <label className="block text-xs font-semibold text-slate-500 mb-1 uppercase tracking-wider">Email Address</label>
+                <label className="block text-xs font-medium text-slate-500 mb-1.5">Email address</label>
                 <input 
                   type="email" 
                   value={authEmail} 
                   onChange={e => setAuthEmail(e.target.value)}
-                  className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600" 
+                  className="w-full bg-white border border-slate-200 rounded-lg px-3.5 py-2 text-xs font-medium focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600" 
                   placeholder="aisha@example.com"
                 />
               </div>
               <div>
-                <label className="block text-xs font-semibold text-slate-500 mb-1 uppercase tracking-wider">Password</label>
+                <label className="block text-xs font-medium text-slate-500 mb-1.5">Password</label>
                 <input 
                   type="password" 
                   value={authPassword} 
                   onChange={e => setAuthPassword(e.target.value)}
-                  className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
+                  className="w-full bg-white border border-slate-200 rounded-lg px-3.5 py-2 text-xs font-medium focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
                   placeholder="••••••••"
                 />
               </div>
               <button 
                 onClick={() => handleAuth("register")}
-                className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-xl transition-all shadow-sm mt-6 cursor-pointer"
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold py-2.5 rounded-lg transition-all shadow-sm mt-6 cursor-pointer"
               >
                 Register
               </button>
             </div>
             
-            <p className="text-sm text-slate-500 text-center mt-6">
-              Already have an account? <button onClick={() => { setView("login"); setAuthError(""); }} className="text-blue-600 hover:underline font-medium">Log in</button>
+            <p className="text-xs text-slate-500 text-center mt-6">
+              Already have an account? <button onClick={() => { setView("login"); setAuthError(""); }} className="text-blue-600 hover:underline font-semibold cursor-pointer">Log in</button>
             </p>
           </div>
         )}
-
         {/* VIEW: DASHBOARD */}
         {view === "dashboard" && (
-          <div className="space-y-8">
+          <div className="space-y-8 animate-fade-in">
             {/* KPI Cards Header */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              <div className="p-5 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-4">
-                <div className="p-3 bg-blue-50 text-blue-600 rounded-lg"><Users className="w-5 h-5" /></div>
+              <div className="p-4 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-3.5">
+                <div className="p-2.5 bg-blue-50 text-blue-600 border border-blue-100 rounded-lg"><Users className="w-5 h-5" strokeWidth={1.5} /></div>
                 <div>
-                  <p className="text-[10px] font-bold text-slate-400 uppercase">Groups</p>
-                  <p className="font-extrabold text-xl">{groups.length}</p>
+                  <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Active groups</p>
+                  <p className="font-bold text-lg text-slate-900">{groups.length}</p>
                 </div>
               </div>
-              <div className="p-5 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-4">
-                <div className="p-3 bg-emerald-50 text-emerald-600 rounded-lg"><ArrowLeftRight className="w-5 h-5" /></div>
+              <div className="p-4 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-3.5">
+                <div className="p-2.5 bg-green-50 text-green-600 border border-green-100 rounded-lg"><Receipt className="w-5 h-5" strokeWidth={1.5} /></div>
                 <div>
-                  <p className="text-[10px] font-bold text-slate-400 uppercase">Expenses Created</p>
-                  <p className="font-extrabold text-xl">
-                    {groups.reduce((acc, g) => acc + (g as any).expenses?.length || 0, 0)}
+                  <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Reconciled expenses</p>
+                  <p className="font-bold text-lg text-slate-900">
+                    {groups.reduce((acc, g) => acc + ((g as any).expenses?.length || 0), 0)}
                   </p>
                 </div>
               </div>
-              <div className="p-5 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-4">
-                <div className="p-3 bg-indigo-50 text-indigo-600 rounded-lg"><CheckSquare className="w-5 h-5" /></div>
+              <div className="p-4 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-3.5">
+                <div className="p-2.5 bg-emerald-50 text-emerald-600 border border-emerald-100 rounded-lg"><ArrowRightLeft className="w-5 h-5" strokeWidth={1.5} /></div>
                 <div>
-                  <p className="text-[10px] font-bold text-slate-400 uppercase">Settlements</p>
-                  <p className="font-extrabold text-xl">
-                    {groups.reduce((acc, g) => acc + (g as any).settlements?.length || 0, 0)}
+                  <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Logged settlements</p>
+                  <p className="font-bold text-lg text-slate-900">
+                    {groups.reduce((acc, g) => acc + ((g as any).settlements?.length || 0), 0)}
                   </p>
                 </div>
               </div>
-              <div className="p-5 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-4">
-                <div className="p-3 bg-purple-50 text-purple-600 rounded-lg"><FileText className="w-5 h-5" /></div>
+              <div className="p-4 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-3.5">
+                <div className="p-2.5 bg-amber-50 text-amber-600 border border-amber-100 rounded-lg"><FileSpreadsheet className="w-5 h-5" strokeWidth={1.5} /></div>
                 <div>
-                  <p className="text-[10px] font-bold text-slate-400 uppercase">Import Jobs</p>
-                  <p className="font-extrabold text-xl">{importJobs.length}</p>
+                  <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Spreadsheet uploads</p>
+                  <p className="font-bold text-lg text-slate-900">{importJobs.length}</p>
                 </div>
               </div>
             </div>
 
             {/* Balance Snapshot Section */}
-            <div className="space-y-4">
-              <h3 className="font-bold text-base text-slate-800 flex items-center">
-                <ArrowLeftRight className="w-4 h-4 mr-2 text-slate-500" strokeWidth={1.5} /> Balance Snapshot
+            <div className="space-y-3">
+              <h3 className="font-semibold text-sm text-slate-800 flex items-center">
+                <ArrowRightLeft className="w-4 h-4 mr-2 text-slate-400" strokeWidth={1.5} /> Balance snapshot
               </h3>
               {loadingBalances ? (
                 <SnapshotSkeleton />
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  {/* Creditors Card (Owed to User) */}
+                  {/* Creditors Card (Accounts Receivable) */}
                   <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm space-y-4">
                     <div className="flex items-center justify-between">
-                      <div className="flex items-center space-x-2">
-                        <div className="p-2 bg-green-50 text-green-600 rounded-lg">
+                      <div className="flex items-center space-x-2.5">
+                        <div className="p-2 bg-green-50 text-green-600 border border-green-100 rounded-lg">
                           <ArrowUpRight className="w-4 h-4" strokeWidth={1.5} />
                         </div>
                         <div>
-                          <h4 className="font-bold text-sm text-slate-800">People Who Owe You</h4>
-                          <p className="text-[10px] text-slate-400">Total outstanding receivables</p>
+                          <h4 className="font-semibold text-sm text-slate-800">Accounts receivable</h4>
+                          <p className="text-[10px] text-slate-400 font-medium">Outstanding funds to collect</p>
                         </div>
                       </div>
-                      <span className="font-extrabold text-base text-green-600">
+                      <span className="font-bold text-base text-green-600">
                         {globalBalances?.creditors?.reduce((sum: number, c: any) => sum + c.amount, 0).toLocaleString("en-IN", { style: "currency", currency: "INR" }) || "₹0.00"}
                       </span>
                     </div>
 
-                    <div className="space-y-2 max-h-[200px] overflow-y-auto pr-1">
+                    <div className="space-y-2 max-h-[180px] overflow-y-auto pr-1 custom-scrollbar">
                       {!globalBalances || globalBalances.creditors?.length === 0 ? (
-                        <p className="text-xs text-slate-400 py-4 text-center">No outstanding receivables.</p>
+                        <p className="text-xs text-slate-400 py-4 text-center font-medium">No outstanding receivables.</p>
                       ) : (
                         globalBalances.creditors?.map((c: any, idx: number) => (
-                          <div key={idx} className="flex items-center justify-between p-2.5 bg-green-50/20 border border-green-100 rounded-lg text-xs">
-                            <span className="font-semibold text-slate-700">{c.userName} <span className="text-[10px] text-slate-400 font-normal">in {c.groupName}</span></span>
-                            <span className="font-bold text-green-700">+{c.amount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}</span>
+                          <div key={idx} className="flex items-center justify-between p-2.5 bg-green-50/20 border border-green-100/50 rounded-lg text-xs">
+                            <span className="font-medium text-slate-700">{c.userName} <span className="text-[10px] text-slate-400 font-normal">in {c.groupName}</span></span>
+                            <span className="font-semibold text-green-700">+{c.amount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}</span>
                           </div>
                         ))
                       )}
                     </div>
                   </div>
 
-                  {/* Debtors Card (User Owes) */}
+                  {/* Debtors Card (Accounts Payable) */}
                   <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm space-y-4">
                     <div className="flex items-center justify-between">
-                      <div className="flex items-center space-x-2">
-                        <div className="p-2 bg-red-50 text-red-600 rounded-lg">
+                      <div className="flex items-center space-x-2.5">
+                        <div className="p-2 bg-red-50 text-red-600 border border-red-100 rounded-lg">
                           <ArrowDownRight className="w-4 h-4" strokeWidth={1.5} />
                         </div>
                         <div>
-                          <h4 className="font-bold text-sm text-slate-800">People You Owe</h4>
-                          <p className="text-[10px] text-slate-400">Total outstanding payables</p>
+                          <h4 className="font-semibold text-sm text-slate-800">Accounts payable</h4>
+                          <p className="text-[10px] text-slate-400 font-medium">Outstanding funds to repay</p>
                         </div>
                       </div>
-                      <span className="font-extrabold text-base text-red-600">
+                      <span className="font-bold text-base text-red-600">
                         {globalBalances?.debtors?.reduce((sum: number, d: any) => sum + d.amount, 0).toLocaleString("en-IN", { style: "currency", currency: "INR" }) || "₹0.00"}
                       </span>
                     </div>
 
-                    <div className="space-y-2 max-h-[200px] overflow-y-auto pr-1">
+                    <div className="space-y-2 max-h-[180px] overflow-y-auto pr-1 custom-scrollbar">
                       {!globalBalances || globalBalances.debtors?.length === 0 ? (
-                        <p className="text-xs text-slate-400 py-4 text-center">No outstanding payables.</p>
+                        <p className="text-xs text-slate-400 py-4 text-center font-medium">No outstanding payables.</p>
                       ) : (
                         globalBalances.debtors?.map((d: any, idx: number) => (
-                          <div key={idx} className="flex items-center justify-between p-2.5 bg-red-50/20 border border-red-100 rounded-lg text-xs">
-                            <span className="font-semibold text-slate-700">{d.userName} <span className="text-[10px] text-slate-400 font-normal">in {d.groupName}</span></span>
-                            <span className="font-bold text-red-700">-{d.amount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}</span>
+                          <div key={idx} className="flex items-center justify-between p-2.5 bg-red-50/20 border border-red-100/50 rounded-lg text-xs">
+                            <span className="font-medium text-slate-700">{d.userName} <span className="text-[10px] text-slate-400 font-normal">in {d.groupName}</span></span>
+                            <span className="font-semibold text-red-700">-{d.amount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}</span>
                           </div>
                         ))
                       )}
@@ -1099,21 +1204,21 @@ export default function App() {
               
               {/* Groups listing */}
               <div className="lg:col-span-2 bg-white border border-slate-200 rounded-xl p-6 shadow-sm flex flex-col">
-                <div className="flex items-center justify-between mb-6">
-                  <h3 className="font-bold text-base text-slate-800 flex items-center">
-                    <Users className="w-4 h-4 mr-2 text-slate-500" /> My Groups
+                <div className="flex items-center justify-between mb-5">
+                  <h3 className="font-semibold text-sm text-slate-800 flex items-center">
+                    <Users className="w-4 h-4 mr-2 text-slate-400" strokeWidth={1.5} /> Reconciliation accounts
                   </h3>
                   <div className="flex space-x-2">
                     <input 
                       type="text" 
                       value={newGroupName}
                       onChange={e => setNewGroupName(e.target.value)}
-                      className="bg-white border border-slate-300 px-3 py-1.5 text-xs rounded-lg focus:outline-none focus:border-blue-600 text-slate-800"
+                      className="bg-white border border-slate-200 px-3 py-1.5 text-xs rounded-lg focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600 text-slate-800 font-medium"
                       placeholder="New group name..."
                     />
                     <button 
                       onClick={handleCreateGroup}
-                      className="bg-blue-600 hover:bg-blue-700 text-white px-3.5 py-1.5 text-xs rounded-lg font-medium transition-colors shadow-sm cursor-pointer"
+                      className="bg-blue-600 hover:bg-blue-700 text-white px-3.5 py-1.5 text-xs rounded-lg font-semibold transition-colors shadow-sm cursor-pointer"
                     >
                       Create
                     </button>
@@ -1123,9 +1228,9 @@ export default function App() {
                 {loadingGroups ? (
                   <GroupSkeleton />
                 ) : groups.length === 0 ? (
-                  <div className="flex-1 flex flex-col items-center justify-center p-12 text-slate-400">
-                    <Users className="w-10 h-10 mb-2 stroke-1" />
-                    <p className="text-xs">No sharing groups found.</p>
+                  <div className="flex-1 flex flex-col items-center justify-center p-12 text-slate-400 border border-dashed border-slate-200 rounded-xl">
+                    <Users className="w-8 h-8 mb-2 text-slate-300 stroke-1" />
+                    <p className="text-xs font-medium">No reconciliation accounts found.</p>
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -1133,27 +1238,27 @@ export default function App() {
                       <div 
                         key={g.id} 
                         onClick={() => { setSelectedGroupId(g.id); fetchGroupDetails(g.id); setGroupTab("overview"); setView("group-detail"); }}
-                        className="p-5 bg-white border border-slate-200 rounded-xl hover:border-blue-600 hover:shadow transition-all cursor-pointer group flex flex-col justify-between"
+                        className="p-4 bg-white border border-slate-200 rounded-xl hover:border-blue-500 hover:shadow-md transition-all cursor-pointer group flex flex-col justify-between"
                       >
                         <div>
-                          <h4 className="font-bold text-slate-800 group-hover:text-blue-600 transition-colors mb-1">{g.name}</h4>
-                          <p className="text-xs text-slate-500 mb-4">{g.memberships.length} members active</p>
+                          <h4 className="font-semibold text-sm text-slate-800 group-hover:text-blue-600 transition-colors mb-1">{g.name}</h4>
+                          <p className="text-xs text-slate-400 font-medium mb-4">{g.memberships.length} members active</p>
                         </div>
                         <div className="flex items-center justify-between border-t border-slate-100 pt-3">
                           <div className="flex -space-x-1.5">
                             {g.memberships.slice(0, 4).map(m => (
-                              <div key={m.id} className="w-6 h-6 rounded-full bg-slate-100 border border-white flex items-center justify-center text-[10px] font-bold text-blue-600" title={m.user.name}>
-                                {m.user.name[0]}
+                              <div key={m.id} className="w-6 h-6 rounded-full bg-slate-100 border border-white flex items-center justify-center text-[9px] font-bold text-blue-700" title={m.user.name}>
+                                {m.user.name[0].toUpperCase()}
                               </div>
                             ))}
                             {g.memberships.length > 4 && (
-                              <div className="w-6 h-6 rounded-full bg-slate-100 border border-white flex items-center justify-center text-[10px] font-bold text-slate-500">
+                              <div className="w-6 h-6 rounded-full bg-slate-100 border border-white flex items-center justify-center text-[9px] font-bold text-slate-500">
                                 +{g.memberships.length - 4}
                               </div>
                             )}
                           </div>
-                          <span className="text-xs font-semibold text-blue-600 group-hover:translate-x-1 transition-transform flex items-center">
-                            Open <ArrowRight className="w-3.5 h-3.5 ml-1" />
+                          <span className="text-xs font-semibold text-blue-600 group-hover:translate-x-0.5 transition-transform flex items-center">
+                            Open group <ArrowRight className="w-3.5 h-3.5 ml-1" strokeWidth={1.5} />
                           </span>
                         </div>
                       </div>
@@ -1162,27 +1267,30 @@ export default function App() {
                 )}
               </div>
 
-              {/* Recent Imports */}
-              <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-                <h3 className="font-bold text-base text-slate-800 mb-4 flex items-center">
-                  <FileText className="w-4 h-4 mr-2 text-slate-500" /> Recent Imports
+              {/* Recent Ingestions */}
+              <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm flex flex-col">
+                <h3 className="font-semibold text-sm text-slate-800 mb-4 flex items-center">
+                  <FileSpreadsheet className="w-4 h-4 mr-2 text-slate-400" strokeWidth={1.5} /> Recent ingestion files
                 </h3>
-                <div className="space-y-3 max-h-[350px] overflow-y-auto pr-1">
+                <div className="space-y-3 max-h-[300px] overflow-y-auto pr-1 flex-1 custom-scrollbar">
                   {importJobs.length === 0 ? (
-                    <p className="text-xs text-slate-400 text-center py-8">No spreadsheets imported.</p>
+                    <div className="flex flex-col items-center justify-center py-12 text-slate-400">
+                      <FileSpreadsheet className="w-7 h-7 mb-1.5 text-slate-200 stroke-1" />
+                      <p className="text-xs font-medium">No spreadsheets imported.</p>
+                    </div>
                   ) : (
                     importJobs.map(j => (
-                      <div key={j.id} className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between text-xs">
+                      <div key={j.id} className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between text-xs font-medium">
                         <div className="space-y-0.5">
-                          <p className="font-semibold text-slate-800 truncate max-w-[150px]">{j.rawFileName}</p>
-                          <p className="text-[10px] text-slate-400">{new Date(j.uploadedAt).toLocaleDateString()}</p>
+                          <p className="font-semibold text-slate-800 truncate max-w-[130px]">{j.rawFileName}</p>
+                          <p className="text-[10px] text-slate-400 font-medium">{new Date(j.uploadedAt).toLocaleDateString()}</p>
                         </div>
-                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                          j.status === "COMPLETED" ? "bg-green-100 text-green-800" :
-                          j.status === "REVIEW_REQUIRED" ? "bg-amber-100 text-amber-800" :
-                          "bg-slate-100 text-slate-600"
+                        <span className={`px-2 py-0.5 rounded text-[9px] font-bold border ${
+                          j.status === "COMPLETED" ? "bg-green-50 border-green-200 text-green-700" :
+                          j.status === "REVIEW_REQUIRED" ? "bg-amber-50 border-amber-200 text-amber-700" :
+                          "bg-slate-100 border-slate-200 text-slate-600"
                         }`}>
-                          {j.status}
+                          {j.status === "REVIEW_REQUIRED" ? "Review required" : j.status.toLowerCase()}
                         </span>
                       </div>
                     ))
@@ -1192,26 +1300,58 @@ export default function App() {
 
             </div>
 
-            {/* Recent Activity timeline mock */}
-            <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-              <h3 className="font-bold text-base text-slate-800 mb-4 flex items-center">
-                <Activity className="w-4 h-4 mr-2 text-slate-500" /> Activity Log
+            {/* Structured Financial Ledger Audit Trail */}
+            <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm space-y-4">
+              <h3 className="font-semibold text-sm text-slate-800 flex items-center">
+                <Activity className="w-4 h-4 mr-2 text-slate-400" strokeWidth={1.5} /> Ledger audit trail
               </h3>
-              <div className="space-y-4">
-                <div className="flex items-start space-x-3 text-xs">
-                  <div className="w-2 h-2 rounded-full bg-blue-600 mt-1.5"></div>
-                  <div>
-                    <p className="text-slate-800 font-medium">Database schema compatibility verified successfully.</p>
-                    <p className="text-[10px] text-slate-400">June 13, 2026</p>
-                  </div>
-                </div>
-                <div className="flex items-start space-x-3 text-xs">
-                  <div className="w-2 h-2 rounded-full bg-emerald-600 mt-1.5"></div>
-                  <div>
-                    <p className="text-slate-800 font-medium">Historical member periods seeded: Aisha, Rohan, Priya, Meera, Sam, Dev.</p>
-                    <p className="text-[10px] text-slate-400">June 13, 2026</p>
-                  </div>
-                </div>
+              
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs border-collapse">
+                  <thead>
+                    <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase tracking-wider text-[10px]">
+                      <th className="py-2.5 px-4">Timestamp</th>
+                      <th className="py-2.5 px-4">Operator</th>
+                      <th className="py-2.5 px-4">Action event</th>
+                      <th className="py-2.5 px-4 text-right">Reference amount</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {dynamicTimeline.length === 0 ? (
+                      <tr>
+                        <td colSpan={4} className="py-8 text-center text-slate-400 font-medium">No audit logs written.</td>
+                      </tr>
+                    ) : (
+                      dynamicTimeline.map((item) => (
+                        <tr key={item.id} className="border-b border-slate-100 hover:bg-slate-50/50 text-slate-700 font-medium">
+                          <td className="py-2.5 px-4 whitespace-nowrap text-slate-500 font-mono text-[10px]">
+                            {new Date(item.date).toLocaleDateString("en-IN")} {new Date(item.date).toLocaleTimeString("en-IN", { hour: '2-digit', minute: '2-digit' })}
+                          </td>
+                          <td className="py-2.5 px-4 font-semibold text-slate-800">
+                            {item.user}
+                          </td>
+                          <td className="py-2.5 px-4">
+                            <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-bold border mr-2.5 ${
+                              item.category === "Expense" ? "bg-blue-50 border-blue-100 text-blue-700" :
+                              item.category === "Settlement" ? "bg-green-50 border-green-100 text-green-700" :
+                              "bg-slate-100 border-slate-200 text-slate-600"
+                            }`}>
+                              {item.category}
+                            </span>
+                            <span className="text-slate-900">{item.title}</span>
+                          </td>
+                          <td className="py-2.5 px-4 text-right font-semibold text-slate-950">
+                            {item.amount && item.category !== "Import" ? (
+                              item.amount.toLocaleString("en-IN", { style: "currency", currency: "INR" })
+                            ) : item.amount && item.category === "Import" ? (
+                              `${item.amount} rows`
+                            ) : "-"}
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
               </div>
             </div>
 
@@ -1264,30 +1404,78 @@ export default function App() {
             {groupTab === "overview" && (
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                 <div className="lg:col-span-2 space-y-6">
-                  {/* Group Summary card */}
-                  <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm space-y-4">
-                    <h3 className="font-bold text-base text-slate-850">Group Summary</h3>
-                    <div className="grid grid-cols-3 gap-4 text-center">
-                      <div className="p-3 bg-slate-50 border border-slate-100 rounded-lg">
-                        <p className="text-[10px] text-slate-400 font-bold uppercase">Members</p>
-                        <p className="text-lg font-extrabold text-slate-800">{selectedGroup.memberships.length}</p>
+                  {/* Premium Financial Analytics Overview */}
+                  {(() => {
+                    const totalGroupExp = expenses.reduce((acc, e) => acc + e.normalizedAmount, 0);
+                    const currentPeriodGroupExp = expenses
+                      .filter(e => (Date.now() - new Date(e.expenseDate).getTime()) <= 30 * 24 * 60 * 60 * 1000)
+                      .reduce((acc, e) => acc + e.normalizedAmount, 0);
+
+                    const userSummary = balances?.summaries.find(s => s.userId === currentUser?.id);
+                    const netBal = userSummary ? userSummary.netBalance : 0;
+                    const isCreditor = netBal > 0.01;
+                    const isDebtor = netBal < -0.01;
+
+                    const activeMembersCount = selectedGroup.memberships.filter(m => !m.leftAt).length;
+                    const pendingSettlementsCount = balances?.simplifiedDebts.length || 0;
+
+                    return (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                        <div className={`p-4 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-3.5 ${
+                          isCreditor ? "border-l-4 border-l-green-500" : isDebtor ? "border-l-4 border-l-red-500" : ""
+                        }`}>
+                          <div className={`p-2 rounded-lg border ${
+                            isCreditor ? "bg-green-50 text-green-600 border-green-100" : 
+                            isDebtor ? "bg-red-50 text-red-600 border-red-100" : 
+                            "bg-slate-50 text-slate-500 border-slate-100"
+                          }`}>
+                            {isCreditor ? <ArrowUpRight className="w-5 h-5" strokeWidth={1.5} /> : 
+                             isDebtor ? <ArrowDownRight className="w-5 h-5" strokeWidth={1.5} /> : 
+                             <ArrowRightLeft className="w-5 h-5" strokeWidth={1.5} />}
+                          </div>
+                          <div>
+                            <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Net balance</p>
+                            <p className={`font-bold text-base ${isCreditor ? "text-green-600" : isDebtor ? "text-red-600" : "text-slate-900"}`}>
+                              {isCreditor ? "+" : ""}{netBal.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="p-4 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-3.5">
+                          <div className="p-2.5 bg-blue-50 text-blue-600 border border-blue-100 rounded-lg"><Receipt className="w-5 h-5" strokeWidth={1.5} /></div>
+                          <div>
+                            <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Total expenses</p>
+                            <p className="font-bold text-base text-slate-900">{totalGroupExp.toLocaleString("en-IN", { style: "currency", currency: "INR" })}</p>
+                            <p className="text-[9px] text-slate-400 font-medium">₹{currentPeriodGroupExp.toLocaleString("en-IN")} this month</p>
+                          </div>
+                        </div>
+
+                        <div className="p-4 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-3.5">
+                          <div className="p-2.5 bg-slate-100 text-slate-600 border border-slate-200 rounded-lg"><Users className="w-5 h-5" strokeWidth={1.5} /></div>
+                          <div>
+                            <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Active members</p>
+                            <p className="font-bold text-base text-slate-900">{activeMembersCount} / {selectedGroup.memberships.length}</p>
+                          </div>
+                        </div>
+
+                        <div className="p-4 bg-white border border-slate-200 rounded-xl shadow-sm flex items-center space-x-3.5">
+                          <div className="p-2.5 bg-emerald-50 text-emerald-600 border border-emerald-100 rounded-lg"><CheckCircle className="w-5 h-5" strokeWidth={1.5} /></div>
+                          <div>
+                            <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Settlement status</p>
+                            <p className="font-bold text-base text-slate-900">
+                              {pendingSettlementsCount === 0 ? "Fully reconciled" : `${pendingSettlementsCount} outstanding`}
+                            </p>
+                          </div>
+                        </div>
                       </div>
-                      <div className="p-3 bg-slate-50 border border-slate-100 rounded-lg">
-                        <p className="text-[10px] text-slate-400 font-bold uppercase">Expenses</p>
-                        <p className="text-lg font-extrabold text-slate-800">{expenses.length}</p>
-                      </div>
-                      <div className="p-3 bg-slate-50 border border-slate-100 rounded-lg">
-                        <p className="text-[10px] text-slate-400 font-bold uppercase">Settlements</p>
-                        <p className="text-lg font-extrabold text-slate-800">{settlements.length}</p>
-                      </div>
-                    </div>
-                  </div>
+                    );
+                  })()}
 
                   {/* Quick CSV Import Trigger */}
-                  <div className="bg-blue-50/50 border border-blue-200/50 rounded-xl p-6 shadow-sm flex flex-col sm:flex-row items-center justify-between gap-4">
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-5 shadow-sm flex flex-col sm:flex-row items-center justify-between gap-4">
                     <div>
-                      <h4 className="font-bold text-blue-900 text-sm">Upload spreadsheet data</h4>
-                      <p className="text-xs text-blue-700/80 mt-0.5">Import raw csv and run pluggable anomaly engine verification checks.</p>
+                      <h4 className="font-semibold text-slate-800 text-xs">Ingest spreadsheet data</h4>
+                      <p className="text-[11px] text-slate-500 mt-0.5">Reconcile raw transaction statements and execute pipeline safety rules.</p>
                     </div>
                     <div className="flex items-center space-x-3 w-full sm:w-auto">
                       <input 
@@ -1299,14 +1487,14 @@ export default function App() {
                       />
                       <label 
                         htmlFor="csv-file-quick"
-                        className="flex-1 sm:flex-none bg-white border border-slate-350 hover:bg-slate-50 text-slate-700 px-4 py-2 text-xs font-semibold rounded-lg cursor-pointer text-center"
+                        className="flex-1 sm:flex-none bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 px-4 py-2 text-xs font-semibold rounded-lg cursor-pointer text-center transition-colors shadow-sm"
                       >
                         {importFile ? importFile.name : "Select CSV file"}
                       </label>
                       {importFile && (
                         <button
-                          onClick={handleUploadCsv}
-                          className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-xs font-semibold rounded-lg cursor-pointer transition-all"
+                          onClick={() => handleUploadCsv()}
+                          className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 text-xs font-semibold rounded-lg cursor-pointer transition-all shadow-sm"
                         >
                           Analyze
                         </button>
@@ -1315,15 +1503,22 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Right side widgets: Mini Member logs */}
-                <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm h-fit">
-                  <h4 className="font-bold text-slate-800 text-sm mb-4">Active Members</h4>
+                {/* Right side widgets: Active Members list */}
+                <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm h-fit space-y-4">
+                  <h4 className="font-semibold text-slate-800 text-xs flex items-center">
+                    <Users className="w-3.5 h-3.5 mr-1.5 text-slate-400" strokeWidth={1.5} /> Active members
+                  </h4>
                   <div className="space-y-3">
                     {selectedGroup.memberships.map(m => (
-                      <div key={m.id} className="flex items-center justify-between text-xs">
-                        <span className="font-semibold text-slate-700">{m.user.name}</span>
-                        <span className={`px-2 py-0.5 rounded-[4px] text-[10px] font-bold ${
-                          m.leftAt ? "bg-red-50 text-red-700" : "bg-emerald-50 text-emerald-700"
+                      <div key={m.id} className="flex items-center justify-between text-xs font-medium">
+                        <div className="flex items-center space-x-2">
+                          <div className="w-5 h-5 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-[9px] font-bold text-slate-700">
+                            {m.user.name[0].toUpperCase()}
+                          </div>
+                          <span className="text-slate-700">{m.user.name}</span>
+                        </div>
+                        <span className={`px-2 py-0.5 rounded text-[9px] font-bold border ${
+                          m.leftAt ? "bg-red-50 border-red-200 text-red-700" : "bg-green-50 border-green-200 text-green-700"
                         }`}>
                           {m.leftAt ? "Inactive" : "Active"}
                         </span>
@@ -1635,7 +1830,7 @@ export default function App() {
                           <td className="py-3 px-4">{m.leftAt ? new Date(m.leftAt).toLocaleDateString() : "Active Member"}</td>
                           <td className="py-3 px-4">
                             <span className={`px-2 py-0.5 rounded-[4px] text-[10px] font-bold ${
-                              m.leftAt ? "bg-red-55 border border-red-200 text-red-700" : "bg-green-55 border border-green-200 text-green-700"
+                              m.leftAt ? "bg-red-50 border border-red-200 text-red-700" : "bg-green-50 border border-green-200 text-green-700"
                             }`}>
                               {m.leftAt ? "Inactive" : "Active"}
                             </span>
@@ -1691,97 +1886,99 @@ export default function App() {
                 </div>
               </div>
             )}
-            {/* TAB CONTENT: BALANCES & DEBT PLAN */}
-            {groupTab === "balances" && (
-              <div className="space-y-6">
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+          {groupTab === "balances" && (
+            <div className="space-y-6 animate-fade-in">
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                   
                   {/* Balance ledger card */}
-                  <div className="lg:col-span-2 bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-                    <h3 className="font-bold text-base text-slate-800 mb-4 flex items-center">
-                      <ArrowLeftRight className="w-4 h-4 mr-2 text-slate-500" /> Group Balances
-                    </h3>
+                  <div className="lg:col-span-2 bg-white border border-slate-200 rounded-xl p-6 shadow-sm flex flex-col justify-between">
+                    <div>
+                      <h3 className="font-semibold text-sm text-slate-800 mb-4 flex items-center">
+                        <ArrowRightLeft className="w-4 h-4 mr-2 text-slate-400" strokeWidth={1.5} /> Group balances
+                      </h3>
 
-                    {balances && balances.summaries.length > 0 ? (
-                      <div className="space-y-3">
-                        {balances.summaries.map(s => {
-                          const isCreditor = s.netBalance > 0.01;
-                          const isDebtor = s.netBalance < -0.01;
-                          return (
-                            <div 
-                              key={s.userId}
-                              onClick={() => setTraceUser(s)}
-                              className={`p-4 border rounded-xl flex items-center justify-between transition-all cursor-pointer shadow-sm hover:shadow ${
-                                isCreditor ? "bg-green-50/20 border-green-200 hover:border-green-400" :
-                                isDebtor ? "bg-red-50/20 border-red-200 hover:border-red-400" :
-                                "bg-slate-50 border-slate-200 hover:border-slate-350"
-                              }`}
-                            >
-                              <div className="flex items-center space-x-3">
-                                <div className={`w-9 h-9 rounded-lg flex items-center justify-center font-bold text-sm ${
-                                  isCreditor ? "bg-green-100 text-green-800" :
-                                  isDebtor ? "bg-red-100 text-red-800" :
-                                  "bg-slate-200 text-slate-650"
-                                }`}>
-                                  {s.userName[0]}
-                                </div>
-                                <div>
-                                  <h4 className="font-bold text-sm text-slate-800">{s.userName}</h4>
-                                  <div className="flex items-center space-x-1.5 mt-0.5">
-                                    <span className="text-[10px] text-slate-400">Click to audit balances</span>
-                                    {isCreditor && <ArrowUpRight className="w-3 h-3 text-green-600" />}
-                                    {isDebtor && <ArrowDownRight className="w-3 h-3 text-red-650" />}
+                      {balances && balances.summaries.length > 0 ? (
+                        <div className="space-y-3">
+                          {balances.summaries.map(s => {
+                            const isCreditor = s.netBalance > 0.01;
+                            const isDebtor = s.netBalance < -0.01;
+                            return (
+                              <div 
+                                key={s.userId}
+                                onClick={() => setTraceUser(s)}
+                                className={`p-4 border rounded-xl flex items-center justify-between transition-all cursor-pointer shadow-sm hover:shadow-md ${
+                                  isCreditor ? "bg-green-50/10 border-green-200 hover:border-green-350" :
+                                  isDebtor ? "bg-red-50/10 border-red-200 hover:border-red-350" :
+                                  "bg-slate-50 border-slate-200 hover:border-slate-305"
+                                }`}
+                              >
+                                <div className="flex items-center space-x-3">
+                                  <div className={`w-8.5 h-8.5 rounded-lg flex items-center justify-center font-bold text-xs ${
+                                    isCreditor ? "bg-green-50 text-green-700 border border-green-100" :
+                                    isDebtor ? "bg-red-50 text-red-700 border border-red-100" :
+                                    "bg-slate-100 text-slate-600 border border-slate-200"
+                                  }`}>
+                                    {s.userName[0].toUpperCase()}
+                                  </div>
+                                  <div>
+                                    <h4 className="font-semibold text-xs text-slate-800">{s.userName}</h4>
+                                    <div className="flex items-center space-x-1.5 mt-0.5 text-[10px] text-slate-400 font-medium">
+                                      <span>Click to audit balance history</span>
+                                      {isCreditor && <ArrowUpRight className="w-3.5 h-3.5 text-green-600" strokeWidth={1.5} />}
+                                      {isDebtor && <ArrowDownRight className="w-3.5 h-3.5 text-red-600" strokeWidth={1.5} />}
+                                    </div>
                                   </div>
                                 </div>
+                                <div className="text-right">
+                                  <p className={`font-bold text-xs ${
+                                    isCreditor ? "text-green-600" :
+                                    isDebtor ? "text-red-600" :
+                                    "text-slate-500"
+                                  }`}>
+                                    {isCreditor ? "+" : ""}{s.netBalance.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
+                                  </p>
+                                  <span className={`inline-block text-[9px] font-bold px-1.5 py-0.5 rounded border mt-1 ${
+                                    isCreditor ? "bg-green-50 border-green-200 text-green-700" :
+                                    isDebtor ? "bg-red-50 border-red-200 text-red-700" :
+                                    "bg-slate-100 border-slate-200 text-slate-500"
+                                  }`}>
+                                    {isCreditor ? "Gets back" : isDebtor ? "Owes" : "Settled"}
+                                  </span>
+                                </div>
                               </div>
-                              <div className="text-right">
-                                <p className={`font-extrabold text-sm ${
-                                  isCreditor ? "text-green-600" :
-                                  isDebtor ? "text-red-650" :
-                                  "text-slate-500"
-                                }`}>
-                                  {isCreditor ? "+" : ""}{s.netBalance.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
-                                </p>
-                                <span className={`text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded ${
-                                  isCreditor ? "bg-green-100 text-green-800" :
-                                  isDebtor ? "bg-red-100 text-red-800" :
-                                  "bg-slate-100 text-slate-500"
-                                }`}>
-                                  {isCreditor ? "Gets back" : isDebtor ? "Owes" : "Settled"}
-                                </span>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    ) : (
-                      <p className="text-xs text-slate-500 py-4">No balance details computed.</p>
-                    )}
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <p className="text-xs text-slate-550 py-4 text-center font-medium">No balance details computed.</p>
+                      )}
+                    </div>
                   </div>
 
                   {/* Debt optimization plans */}
                   <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm h-fit">
                     <div className="flex items-center justify-between mb-4">
-                      <h3 className="font-bold text-base text-slate-800 flex items-center">
-                        <CheckCircle className="w-4 h-4 mr-2 text-green-650" /> Simplified Debt Plan
+                      <h3 className="font-semibold text-xs text-slate-805 flex items-center">
+                        <CheckCircle className="w-3.5 h-3.5 mr-1.5 text-green-600" strokeWidth={1.5} /> Simplified debt plan
                       </h3>
-                      <div className="flex items-center space-x-1 bg-slate-100 p-0.5 rounded-lg">
+                      <div className="flex items-center space-x-1 bg-slate-100 p-0.5 rounded-lg border border-slate-200">
                         <button
                           onClick={() => setShowOptimized(false)}
-                          className={`px-2 py-1 text-[10px] font-bold rounded-md transition-all ${
+                          className={`px-2 py-1 text-[9px] font-semibold rounded-md transition-all cursor-pointer ${
                             !showOptimized 
-                              ? "bg-white text-slate-800 shadow-sm" 
-                              : "text-slate-500 hover:text-slate-800"
+                              ? "bg-white text-slate-800 shadow-sm border border-slate-200/50" 
+                              : "text-slate-550 hover:text-slate-800"
                           }`}
                         >
                           Raw
                         </button>
                         <button
                           onClick={() => setShowOptimized(true)}
-                          className={`px-2 py-1 text-[10px] font-bold rounded-md transition-all ${
+                          className={`px-2 py-1 text-[9px] font-semibold rounded-md transition-all cursor-pointer ${
                             showOptimized 
-                              ? "bg-white text-slate-800 shadow-sm" 
-                              : "text-slate-500 hover:text-slate-800"
+                              ? "bg-white text-slate-800 shadow-sm border border-slate-200/50" 
+                              : "text-slate-550 hover:text-slate-800"
                           }`}
                         >
                           Optimized
@@ -1791,10 +1988,10 @@ export default function App() {
 
                     {/* Transaction count reduction banner */}
                     {showOptimized && balances && balances.simplifiedDebts.length < rawDebts.length && (
-                      <div className="mb-4 p-3 bg-blue-50 border border-blue-150 rounded-xl flex items-center space-x-2 text-[11px] text-blue-800">
-                        <Sparkles className="w-3.5 h-3.5 text-blue-650 flex-shrink-0 animate-pulse" />
+                      <div className="mb-4 p-3 bg-blue-50 border border-blue-100 rounded-lg flex items-center space-x-2 text-[10px] font-medium text-blue-800">
+                        <Sparkles className="w-3.5 h-3.5 text-blue-600 flex-shrink-0" strokeWidth={1.5} />
                         <div>
-                          Debt minimization saved <b>{rawDebts.length - balances.simplifiedDebts.length}</b> transactions! ({rawDebts.length} raw $\rightarrow$ {balances.simplifiedDebts.length} optimized)
+                          Debt optimized: <b>{rawDebts.length}</b> transactions reduced to <b>{balances.simplifiedDebts.length}</b>!
                         </div>
                       </div>
                     )}
@@ -1805,19 +2002,24 @@ export default function App() {
                         : rawDebts;
 
                       if (debtsToRender.length === 0) {
-                        return <p className="text-xs text-slate-400 py-6 text-center">No outstanding debts!</p>;
+                        return (
+                          <div className="flex flex-col items-center justify-center py-8 text-slate-400">
+                            <CheckCircle className="w-6 h-6 mb-1.5 text-green-500 stroke-1" strokeWidth={1.5} />
+                            <p className="text-xs font-medium">No outstanding debts.</p>
+                          </div>
+                        );
                       }
 
                       return (
-                        <div className="space-y-3">
+                        <div className="space-y-2 max-h-[350px] overflow-y-auto pr-1 custom-scrollbar">
                           {debtsToRender.map((d, idx) => (
-                            <div key={idx} className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between text-xs">
+                            <div key={idx} className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between text-xs font-medium">
                               <div className="flex items-center space-x-2 text-slate-700">
-                                <span className="font-semibold text-red-655">{d.fromUser}</span>
-                                <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
-                                <span className="font-semibold text-green-600">{d.toUser}</span>
+                                <span className="font-semibold text-slate-800">{d.fromUser}</span>
+                                <ArrowRight className="w-3.5 h-3.5 text-slate-400" strokeWidth={1.5} />
+                                <span className="font-semibold text-slate-800">{d.toUser}</span>
                               </div>
-                              <span className="font-extrabold text-blue-750 bg-blue-50 border border-blue-100 px-2 py-0.5 rounded">
+                              <span className="font-semibold text-blue-700 bg-blue-50/50 border border-blue-100 px-2 py-0.5 rounded text-[11px]">
                                 {d.amount.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
                               </span>
                             </div>
@@ -1825,103 +2027,125 @@ export default function App() {
                         </div>
                       );
                     })()}
-                  </div>
-
                 </div>
               </div>
-            )}
+            </div>
+          )}
 
             {/* TAB CONTENT: IMPORTS */}
             {groupTab === "imports" && (
-              <div className="space-y-6">
-                <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-                  <div className="flex items-center justify-between mb-4">
-                    <h3 className="font-bold text-base text-slate-800 flex items-center">
-                      <FileSpreadsheet className="w-4 h-4 mr-2 text-slate-500" /> Spreadsheet Reconciliation History
-                    </h3>
-                    <div className="text-xs text-slate-500">
+              <div className="space-y-6 animate-fade-in">
+                <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden flex flex-col">
+                  <div className="p-5 border-b border-slate-200 flex items-center justify-between bg-slate-50/20">
+                    <div>
+                      <h3 className="font-semibold text-sm text-slate-900 flex items-center">
+                        <FileSpreadsheet className="w-4 h-4 mr-2 text-slate-500" strokeWidth={1.5} /> Spreadsheet reconciliation history
+                      </h3>
+                      <p className="text-[11px] text-slate-400 font-medium mt-0.5">Audit log of all imported CSV spreadsheet jobs</p>
+                    </div>
+                    <div className="text-xs font-semibold text-slate-500 bg-slate-100 border border-slate-200 px-2.5 py-1 rounded-lg">
                       Total spreadsheets imported: {importJobs.filter(j => j.groupId === selectedGroupId).length}
                     </div>
                   </div>
 
-                  <div className="space-y-4">
-                    {importJobs.filter(j => j.groupId === selectedGroupId).length === 0 ? (
-                      <div className="text-center py-12 text-slate-400 space-y-2">
-                        <FileSpreadsheet className="w-10 h-10 mx-auto text-slate-300" />
-                        <p className="text-xs font-semibold">No spreadsheets reconciled for this group yet</p>
-                      </div>
-                    ) : (
-                      importJobs.filter(j => j.groupId === selectedGroupId).map(j => {
-                        const dateStr = new Date(j.uploadedAt).toLocaleString("en-IN", {
-                          day: "numeric",
-                          month: "short",
-                          year: "numeric",
-                          hour: "2-digit",
-                          minute: "2-digit"
-                        });
-                        return (
-                          <div key={j.id} className="p-4 bg-slate-50 border border-slate-200 rounded-xl flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-                            <div className="space-y-1">
-                              <div className="flex items-center space-x-2">
-                                <span className="font-bold text-sm text-slate-800 truncate max-w-[250px]">{j.rawFileName}</span>
-                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                                  j.status === "COMPLETED" ? "bg-green-100 text-green-800" :
-                                  j.status === "REVIEW_REQUIRED" ? "bg-amber-100 text-amber-800" :
-                                  "bg-slate-100 text-slate-655"
-                                }`}>
-                                  {j.status}
-                                </span>
-                              </div>
-                              <p className="text-xs text-slate-400">Imported on {dateStr}</p>
-                              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-650 pt-1">
-                                {j.summary && (
-                                  <>
-                                    <span>Rows: <b>{j.summary.rowsProcessed}</b></span>
-                                    <span>Expenses: <b>+{j.summary.expensesCreated}</b></span>
-                                    <span>Settlements: <b>+{j.summary.settlementsCreated}</b></span>
-                                  </>
-                                )}
-                                <span>Anomalies: <b>{j.anomaliesCount || 0}</b></span>
-                              </div>
-                            </div>
-                            <div className="flex items-center">
-                              <button
-                                onClick={async () => {
-                                  try {
-                                    const res = await api.get(`/imports/jobs/${j.id}`);
-                                    setSelectedImportJob(res.data);
-                                  } catch (err) {
-                                    showToast("Failed to fetch import job details", "error");
-                                  }
-                                }}
-                                className="w-full sm:w-auto bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-semibold px-4 py-2 rounded-lg text-xs cursor-pointer transition-colors shadow-sm text-center"
-                              >
-                                View Report Details
-                              </button>
-                            </div>
-                          </div>
-                        );
-                      })
-                    )}
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse">
+                      <thead>
+                        <tr className="bg-slate-50 text-slate-500 font-semibold text-[10px] border-b border-slate-200">
+                          <th className="py-3 px-5">File name</th>
+                          <th className="py-3 px-5">Status</th>
+                          <th className="py-3 px-5">Imported date</th>
+                          <th className="py-3 px-5">Summary details</th>
+                          <th className="py-3 px-5 text-right">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {importJobs.filter(j => j.groupId === selectedGroupId).length === 0 ? (
+                          <tr>
+                            <td colSpan={5} className="py-12 text-center text-slate-400 font-medium">
+                              <FileSpreadsheet className="w-8 h-8 mx-auto text-slate-300 stroke-1 mb-2" />
+                              No spreadsheets reconciled for this group yet
+                            </td>
+                          </tr>
+                        ) : (
+                          importJobs.filter(j => j.groupId === selectedGroupId).map(j => {
+                            const dateStr = new Date(j.uploadedAt).toLocaleString("en-IN", {
+                              day: "numeric",
+                              month: "short",
+                              year: "numeric",
+                              hour: "2-digit",
+                              minute: "2-digit"
+                            });
+                            return (
+                              <tr key={j.id} className="border-b border-slate-100 hover:bg-slate-50/50 text-xs text-slate-700 font-medium animate-fade-in">
+                                <td className="py-3.5 px-5 font-semibold text-slate-900 truncate max-w-[200px]" title={j.rawFileName}>
+                                  {j.rawFileName}
+                                </td>
+                                <td className="py-3.5 px-5">
+                                  <span className={`inline-block px-2 py-0.5 rounded text-[9px] font-bold border ${
+                                    j.status === "COMPLETED" ? "bg-green-50 border-green-200 text-green-700" :
+                                    j.status === "REVIEW_REQUIRED" ? "bg-amber-50 border-amber-250 text-amber-700" :
+                                    "bg-slate-50 border-slate-200 text-slate-600"
+                                  }`}>
+                                    {j.status === "COMPLETED" ? "Completed" : j.status === "REVIEW_REQUIRED" ? "Review required" : j.status.toLowerCase()}
+                                  </span>
+                                </td>
+                                <td className="py-3.5 px-5 text-slate-400 font-mono text-[10px]">
+                                  {dateStr}
+                                </td>
+                                <td className="py-3.5 px-5 text-slate-550">
+                                  {j.summary ? (
+                                    <div className="flex space-x-3 text-[10px]">
+                                      <span>Rows: <b className="text-slate-700">{j.summary.rowsProcessed}</b></span>
+                                      <span className="text-green-600">Expenses: <b className="font-semibold">+{j.summary.expensesCreated}</b></span>
+                                      <span className="text-blue-600">Settlements: <b className="font-semibold">+{j.summary.settlementsCreated}</b></span>
+                                      <span className="text-amber-600">Anomalies: <b className="font-semibold">{j.anomaliesCount || 0}</b></span>
+                                    </div>
+                                  ) : (
+                                    <span className="text-slate-405 italic">No summary computed</span>
+                                  )}
+                                </td>
+                                <td className="py-3.5 px-5 text-right">
+                                  <button
+                                    onClick={async () => {
+                                      try {
+                                        const res = await api.get(`/imports/jobs/${j.id}`);
+                                        setSelectedImportJob(res.data);
+                                      } catch (err) {
+                                        showToast("Failed to fetch import job details", "error");
+                                      }
+                                    }}
+                                    className="bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 font-semibold px-3 py-1.5 rounded-lg text-[10px] cursor-pointer transition-colors shadow-sm inline-flex items-center"
+                                  >
+                                    View report details
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })
+                        )}
+                      </tbody>
+                    </table>
                   </div>
                 </div>
               </div>
             )}
           </div>
         )}
-                  {/* VIEW: CSV IMPORT QUEUE (REVIEW WORKFLOW REDESIGN) */}
+
+        {/* VIEW: CSV IMPORT QUEUE (REVIEW WORKFLOW REDESIGN) */}
         {view === "import" && selectedGroup && activeImportJobId && (
-          <div className="space-y-6">
+          <div className="space-y-6 animate-fade-in">
             
             <div className="flex items-center justify-between border-b border-slate-200 pb-4">
               <button 
                 onClick={() => { setView("group-detail"); setImportStats(null); setImportStep(1); }}
-                className="text-slate-500 hover:text-slate-850 flex items-center text-sm font-semibold transition-colors cursor-pointer"
+                className="text-slate-500 hover:text-slate-800 flex items-center text-xs font-semibold transition-colors cursor-pointer"
               >
-                <ArrowRight className="w-4 h-4 mr-1 rotate-180" /> Cancel and Back
+                <ArrowRight className="w-4 h-4 mr-1 rotate-180" strokeWidth={1.5} /> Cancel and return
               </button>
-              <h2 className="text-lg font-bold text-slate-900 flex items-center">
-                <FileSpreadsheet className="w-5 h-5 text-blue-600 mr-2" /> Spreadsheet Reconciliation Stepper
+              <h2 className="text-sm font-semibold text-slate-900 flex items-center">
+                <FileSpreadsheet className="w-5 h-5 text-blue-600 mr-2" strokeWidth={1.5} /> Spreadsheet reconciliation pipeline
               </h2>
             </div>
 
@@ -1937,17 +2161,17 @@ export default function App() {
               ].map((s, idx, arr) => (
                 <React.Fragment key={s.step}>
                   <div className="flex items-center space-x-2">
-                    <div className={`w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs transition-all ${
+                    <div className={`w-6.5 h-6.5 rounded-full flex items-center justify-center font-bold text-[10px] border transition-all ${
                       importStep === s.step 
-                        ? "bg-blue-600 text-white shadow-sm ring-4 ring-blue-50" 
+                        ? "bg-blue-600 border-blue-600 text-white shadow-sm ring-4 ring-blue-50" 
                         : importStep > s.step 
-                          ? "bg-green-600 text-white" 
-                          : "bg-slate-100 text-slate-400"
+                          ? "bg-green-600 border-green-600 text-white" 
+                          : "bg-slate-50 border-slate-200 text-slate-400"
                     }`}>
                       {importStep > s.step ? "✓" : s.step}
                     </div>
                     <span className={`text-xs font-semibold ${
-                      importStep === s.step ? "text-slate-800" : "text-slate-400"
+                      importStep === s.step ? "text-slate-850" : "text-slate-400"
                     }`}>{s.label}</span>
                   </div>
                   {idx < arr.length - 1 && (
@@ -1960,22 +2184,83 @@ export default function App() {
             </div>
 
             {/* Stepper Loader View: Parsing */}
-            {importStep === 2 && (
-              <div className="text-center py-16 space-y-4 bg-white border border-slate-200 rounded-2xl max-w-md mx-auto shadow-sm">
-                <div className="animate-spin w-10 h-10 border-4 border-blue-600 border-t-transparent rounded-full mx-auto"></div>
+            {importStep === 2 && !duplicateBatchError && (
+              <div className="text-center py-16 space-y-4 bg-white border border-slate-200 rounded-xl max-w-md mx-auto shadow-sm animate-fade-in">
+                <div className="animate-spin w-8 h-8 border-3 border-blue-600 border-t-transparent rounded-full mx-auto"></div>
                 <div>
-                  <h3 className="font-bold text-slate-800 text-base">Parsing CSV Spreadsheet...</h3>
+                  <h3 className="font-semibold text-slate-800 text-sm">Parsing transactions...</h3>
                   <p className="text-xs text-slate-400 mt-1">Reading raw row content and converting currency representations.</p>
+                </div>
+              </div>
+            )}
+
+            {/* Stepper Loader View: Duplicate Batch Error */}
+            {importStep === 2 && duplicateBatchError && (
+              <div className="max-w-md mx-auto bg-white border border-slate-200 rounded-xl p-6 shadow-sm space-y-5 animate-fade-in">
+                <div className="flex items-center space-x-3 text-amber-500">
+                  <ShieldAlert className="w-8 h-8 shrink-0 text-amber-600" strokeWidth={1.5} />
+                  <div>
+                    <h3 className="font-semibold text-slate-850 text-sm">Duplicate CSV Import Detected</h3>
+                    <p className="text-xs text-slate-400 font-medium">{duplicateBatchError.message}</p>
+                  </div>
+                </div>
+
+                <p className="text-xs text-slate-500 font-medium leading-relaxed">
+                  Ledgerly has detected that the exact same CSV spreadsheet has already been successfully reconciled and imported into this group. Re-importing it normally will duplicate expenses and corrupt your ledger balances.
+                </p>
+
+                <div className="flex flex-col gap-2.5 pt-2">
+                  <button
+                    onClick={async () => {
+                      const jobId = duplicateBatchError.jobId;
+                      setDuplicateBatchError(null);
+                      setImportFile(null);
+                      try {
+                        const res = await api.get(`/imports/jobs/${jobId}`);
+                        setSelectedImportJob(res.data);
+                      } catch (e) {
+                        showToast("Failed to fetch previous import job details.", "error");
+                      }
+                    }}
+                    className="w-full bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold py-2 rounded-lg transition-all shadow-sm cursor-pointer"
+                  >
+                    👀 View previous import
+                  </button>
+
+                  <button
+                    onClick={() => handleUploadCsv("DEMO")}
+                    className="w-full bg-amber-500 hover:bg-amber-600 text-white text-xs font-semibold py-2 rounded-lg transition-all shadow-sm cursor-pointer"
+                  >
+                    🔁 Re-run import (Demo Mode)
+                  </button>
+
+                  <button
+                    onClick={() => handleUploadCsv("FORCE")}
+                    className="w-full bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold py-2 rounded-lg transition-all shadow-sm cursor-pointer"
+                  >
+                    ➕ Force new import (Admin Mode)
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setDuplicateBatchError(null);
+                      setImportStep(1);
+                      setView("group-detail");
+                    }}
+                    className="w-full bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 text-xs font-semibold py-2 rounded-lg transition-all cursor-pointer"
+                  >
+                    Cancel
+                  </button>
                 </div>
               </div>
             )}
 
             {/* Stepper Loader View: Detection */}
             {importStep === 3 && (
-              <div className="text-center py-16 space-y-4 bg-white border border-slate-200 rounded-2xl max-w-md mx-auto shadow-sm">
-                <div className="animate-spin w-10 h-10 border-4 border-blue-600 border-t-transparent rounded-full mx-auto"></div>
+              <div className="text-center py-16 space-y-4 bg-white border border-slate-200 rounded-xl max-w-md mx-auto shadow-sm animate-fade-in">
+                <div className="animate-spin w-8 h-8 border-3 border-blue-600 border-t-transparent rounded-full mx-auto"></div>
                 <div>
-                  <h3 className="font-bold text-slate-800 text-base">Running Anomaly Engine...</h3>
+                  <h3 className="font-semibold text-slate-800 text-sm">Detecting anomalies...</h3>
                   <p className="text-xs text-slate-400 mt-1">Scanning for duplicate rows, missing payers, and date ambiguities.</p>
                 </div>
               </div>
@@ -1983,10 +2268,10 @@ export default function App() {
 
             {/* Stepper Loader View: Finalizing */}
             {importStep === 5 && (
-              <div className="text-center py-16 space-y-4 bg-white border border-slate-200 rounded-2xl max-w-md mx-auto shadow-sm">
-                <div className="animate-spin w-10 h-10 border-4 border-blue-600 border-t-transparent rounded-full mx-auto"></div>
+              <div className="text-center py-16 space-y-4 bg-white border border-slate-200 rounded-xl max-w-md mx-auto shadow-sm animate-fade-in">
+                <div className="animate-spin w-8 h-8 border-3 border-blue-600 border-t-transparent rounded-full mx-auto"></div>
                 <div>
-                  <h3 className="font-bold text-slate-800 text-base">Finalizing Reconciliation...</h3>
+                  <h3 className="font-semibold text-slate-800 text-sm">Finalizing ledger...</h3>
                   <p className="text-xs text-slate-400 mt-1">Applying resolution mappings, writing ledger logs, and updating balances.</p>
                 </div>
               </div>
@@ -1994,56 +2279,72 @@ export default function App() {
 
             {/* Stepper Stage 6: Completed Summary Report */}
             {importStep === 6 && importStats && (
-              <div className="max-w-xl w-full mx-auto bg-white border border-slate-200 rounded-2xl p-8 shadow-sm text-center space-y-6">
-                <div className="w-16 h-16 bg-green-50 text-green-600 rounded-full flex items-center justify-center mx-auto mb-2 border border-green-200">
-                  <CheckCircle className="w-8 h-8" />
+              <div className="max-w-xl w-full mx-auto bg-white border border-slate-200 rounded-xl p-8 shadow-sm text-center space-y-6 animate-fade-in">
+                <div className="w-12 h-12 bg-green-50 text-green-600 rounded-full flex items-center justify-center mx-auto mb-2 border border-green-100">
+                  <CheckCircle className="w-6 h-6" strokeWidth={1.5} />
                 </div>
                 <div>
-                  <h3 className="text-xl font-bold text-slate-900">Import Completed Successfully</h3>
-                  <p className="text-slate-500 text-xs mt-1">Audit resolve logs and new expenses logged in the group database.</p>
+                  <h3 className="text-lg font-semibold text-slate-900">Import completed</h3>
+                  <p className="text-slate-450 text-xs mt-1">Audit resolution logs written and new entries committed to group ledger.</p>
                 </div>
 
-                <div className="grid grid-cols-2 gap-4 p-4 bg-slate-50 border border-slate-200 rounded-xl text-left text-xs text-slate-650">
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 p-4 bg-slate-50 border border-slate-200 rounded-xl text-left text-xs text-slate-500 font-medium">
                   <div>
-                    <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">Rows Processed</p>
-                    <p className="font-extrabold text-slate-800 text-base">{importStats.rowsProcessed}</p>
+                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-1">Rows processed</p>
+                    <p className="font-bold text-slate-800 text-sm">{importStats.rowsProcessed}</p>
                   </div>
                   <div>
-                    <p className="text-[10px] text-slate-450 font-bold uppercase mb-1">Elapsed Duration</p>
-                    <p className="font-extrabold text-slate-800 text-base">
-                      {importStartTime ? ((Date.now() - importStartTime) / 1000).toFixed(1) : "0.0"} seconds
+                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-1">Valid entries</p>
+                    <p className="font-bold text-slate-850 text-sm">
+                      {importStats.rowsProcessed - Object.values(importResolutions).filter(r => r.resolutionAction === "REJECT_ROW").length}
                     </p>
                   </div>
                   <div>
-                    <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">Expenses Created</p>
-                    <p className="font-extrabold text-green-600 text-base">+{importStats.expensesCreated}</p>
+                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-1">Anomalies resolved</p>
+                    <p className="font-bold text-slate-850 text-sm">
+                      {Object.values(importResolutions).filter(r => r.resolutionAction !== null && r.resolutionAction !== "REJECT_ROW").length}
+                    </p>
                   </div>
                   <div>
-                    <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">Settlements Logged</p>
-                    <p className="font-extrabold text-blue-700 text-base">+{importStats.settlementsCreated}</p>
+                    <p className="text-[10px] text-slate-405 font-bold uppercase tracking-wider mb-1">Users mapped</p>
+                    <p className="font-bold text-slate-850 text-sm">
+                      {Object.values(importResolutions).filter(r => r.resolutionAction === "MAPPED_USER").length}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] text-slate-405 font-bold uppercase tracking-wider mb-1">Ledger entries created</p>
+                    <p className="font-bold text-slate-850 text-sm">
+                      {importStats.expensesCreated + importStats.settlementsCreated}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-1">Ingestion duration</p>
+                    <p className="font-bold text-slate-855 text-sm">
+                      {importStartTime ? ((Date.now() - importStartTime) / 1000).toFixed(1) : "0.0"}s
+                    </p>
                   </div>
                 </div>
 
-                <div className="border border-slate-150 p-4 rounded-xl text-left text-xs bg-white space-y-2">
-                  <p className="font-bold text-slate-800">Mapped Entities Summary</p>
-                  <div className="space-y-1 text-slate-650">
-                    <p>• Group Context: <span className="font-semibold text-slate-800">{selectedGroup.name}</span></p>
-                    <p>• Resolved Anomalies: <span className="font-semibold text-slate-800">{Object.values(importResolutions).filter(r => r.resolutionAction !== null).length} items</span></p>
+                <div className="border border-slate-200 p-4 rounded-lg text-left text-xs bg-white space-y-2">
+                  <p className="font-semibold text-slate-800">Entity mapping context</p>
+                  <div className="space-y-1 text-slate-500 font-medium">
+                    <p>• Destination Account: <span className="font-semibold text-slate-855">{selectedGroup.name}</span></p>
+                    <p>• Total Resolution Directives Applied: <span className="font-semibold text-slate-855">{Object.values(importResolutions).filter(r => r.resolutionAction !== null).length} items</span></p>
                   </div>
                 </div>
 
                 <button 
                   onClick={() => { setView("group-detail"); setImportStats(null); setImportStep(1); }}
-                  className="bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs px-6 py-2.5 rounded-lg cursor-pointer transition-all shadow-sm"
+                  className="bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs px-5 py-2 rounded-lg cursor-pointer transition-all shadow-sm"
                 >
-                  View Group Balances
+                  View group balances
                 </button>
               </div>
             )}
 
             {/* Stepper Stage 4: Review Anomalies List */}
             {importStep === 4 && (
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 animate-fade-in">
                 
                 {/* Resolution queue */}
                 <div className="lg:col-span-2 space-y-4">
@@ -2051,41 +2352,43 @@ export default function App() {
                   {/* Bulk Actions controls */}
                   <div className="flex flex-wrap gap-3 items-center justify-between bg-slate-50 border border-slate-200 p-4 rounded-xl">
                     <div className="text-xs font-semibold text-slate-700">
-                      Bulk Queue Operations
+                      Bulk resolutions
                     </div>
                     <div className="flex space-x-3">
                       <button 
                         onClick={handleBulkIgnoreInfo}
-                        className="bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 text-xs px-3 py-1.5 font-semibold rounded-lg cursor-pointer transition-colors shadow-sm"
+                        className="bg-white border border-slate-200 hover:bg-slate-100 text-slate-700 text-xs px-3 py-1.5 font-semibold rounded-lg cursor-pointer transition-colors shadow-sm"
                       >
-                        Ignore Info Alerts
+                        Ignore info alerts
                       </button>
                       <button 
                         onClick={handleBulkAutoResolveSafe}
                         className="bg-blue-600 hover:bg-blue-700 text-white text-xs px-3 py-1.5 font-semibold rounded-lg cursor-pointer transition-all shadow-sm"
                       >
-                        Auto-Resolve Safe Warnings
+                        Apply safe fixes
                       </button>
                     </div>
                   </div>
 
                   {/* Severity tabs */}
-                  <div className="flex border-b border-slate-200 space-x-5 text-xs font-semibold">
+                  <div className="flex border-b border-slate-200 space-x-5 text-xs font-medium">
                     {(["ALL", "BLOCKING", "ERROR", "WARNING", "INFO"] as const).map(tab => {
                       const count = tab === "ALL" 
                         ? activeImportAnomalies.length 
                         : activeImportAnomalies.filter(a => a.severity === tab).length;
+                      
+                      const isActive = anomalyTab === tab;
                       return (
                         <button
                           key={tab}
                           onClick={() => setAnomalyTab(tab)}
-                          className={`pb-2 border-b-2 transition-all cursor-pointer ${
-                            anomalyTab === tab 
-                              ? "border-blue-600 text-blue-600" 
-                              : "border-transparent text-slate-400 hover:text-slate-700"
+                          className={`pb-2 border-b-2 transition-all cursor-pointer font-semibold ${
+                            isActive 
+                              ? "border-blue-600 text-blue-600 font-bold" 
+                              : "border-transparent text-slate-400 hover:text-slate-600"
                           }`}
                         >
-                          {tab.charAt(0) + tab.slice(1).toLowerCase()} ({count})
+                          {tab === "ALL" ? "All" : tab} ({count})
                         </button>
                       );
                     })}
@@ -2100,11 +2403,11 @@ export default function App() {
                     if (filteredAnomalies.length === 0) {
                       return (
                         <div className="p-8 bg-white border border-slate-200 rounded-xl text-center space-y-3 shadow-sm">
-                          <div className="w-10 h-10 bg-green-50 text-green-600 rounded-full flex items-center justify-center mx-auto">
-                            <CheckCircle className="w-5 h-5" />
+                          <div className="w-10 h-10 bg-green-50 text-green-600 rounded-full flex items-center justify-center mx-auto border border-green-150">
+                            <CheckCircle className="w-5 h-5" strokeWidth={1.5} />
                           </div>
-                          <h3 className="font-semibold text-slate-800 text-sm">No anomalies in this view</h3>
-                          <p className="text-xs text-slate-500">All scanned items are clean or resolved under this severity filter.</p>
+                          <h3 className="font-semibold text-slate-800 text-xs">No anomalies in this view</h3>
+                          <p className="text-xs text-slate-405 font-medium">All scanned items are clean or resolved under this severity filter.</p>
                         </div>
                       );
                     }
@@ -2112,6 +2415,26 @@ export default function App() {
                     return filteredAnomalies.map(a => {
                       const resolution = importResolutions[a.fingerprint];
                       const isResolved = resolution && resolution.resolutionAction !== null;
+
+                      // Fix description mapping:
+                      let fixText = "Acknowledge and accept validation warning.";
+                      if (a.anomalyType === "MISSING_PAYER") {
+                        fixText = "Select an active group member to map as payer for this expense.";
+                      } else if (a.anomalyType === "UNKNOWN_USER") {
+                        fixText = "Map the unknown name token to an active group member name.";
+                      } else if (a.anomalyType === "AMBIGUOUS_DATE") {
+                        fixText = "Explicitly choose the correct date format order (DD/MM vs MM/DD).";
+                      } else if (a.anomalyType === "SETTLEMENT_DISGUISED_AS_EXPENSE") {
+                        fixText = "Convert expense format into a direct repayment settlement transaction.";
+                      } else if (a.anomalyType === "DUPLICATE") {
+                        fixText = "Discard duplicate transaction row or approve force import.";
+                      } else if (a.anomalyType === "MEMBERSHIP_VIOLATION") {
+                        fixText = "Exclude member from split or exclude entire row.";
+                      } else if (a.anomalyType === "INVALID_PERCENT_SPLIT") {
+                        fixText = "Adjust participant percentages to sum to exactly 100% or exclude row.";
+                      } else if (a.anomalyType === "INVALID_EXACT_SPLIT") {
+                        fixText = "Adjust participant amounts to sum to exactly the total amount or exclude row.";
+                      }
 
                       return (
                         <div 
@@ -2123,39 +2446,39 @@ export default function App() {
                             "border-slate-200"
                           }`}
                         >
-                          <div className="flex items-center justify-between text-xs">
-                            <span className="font-bold text-slate-400">Row {a.rowNumber} • {a.anomalyType}</span>
-                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                              a.severity === "BLOCKING" ? "bg-red-100 text-red-800" :
-                              a.severity === "ERROR" ? "bg-amber-100 text-amber-800" :
-                              a.severity === "WARNING" ? "bg-yellow-100 text-yellow-800" :
-                              "bg-slate-100 text-slate-650"
+                          <div className="flex items-center justify-between text-xs font-semibold">
+                            <span className="text-slate-400">Row {a.rowNumber} • {a.anomalyType.toLowerCase().replace(/_/g, ' ')}</span>
+                            <span className={`px-2 py-0.5 rounded text-[9px] font-bold border ${
+                              a.severity === "BLOCKING" ? "bg-red-50 border-red-200 text-red-700" :
+                               a.severity === "ERROR" ? "bg-amber-50 border-amber-200 text-amber-700" :
+                              a.severity === "WARNING" ? "bg-yellow-50 border-yellow-200 text-yellow-700" :
+                              "bg-slate-50 border-slate-200 text-slate-600"
                             }`}>
-                              {a.severity}
+                              {a.severity.toLowerCase()}
                             </span>
                           </div>
 
                           <div>
-                            <h4 className="font-bold text-sm text-slate-800">{a.description}</h4>
-                            <p className="text-xs text-slate-500 mt-1">Pluggable rule: {a.fingerprint.split("_").slice(0, 3).join(" ")}</p>
+                            <h4 className="font-semibold text-xs text-slate-800">{a.description}</h4>
+                            <div className="text-[10px] text-slate-400 font-medium mt-1">Rule: {a.fingerprint.split("_").slice(0, 3).join(" ").toLowerCase()}</div>
                           </div>
 
                           {/* Side-by-side Before/After Diff Block */}
-                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 p-3 bg-slate-50 border border-slate-200 rounded-xl text-[11px]">
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 p-3.5 bg-slate-50 border border-slate-200 rounded-lg text-[11px] font-medium">
                             {/* Before (Original CSV) */}
-                            <div className="space-y-1 sm:border-r border-slate-200 sm:pr-2">
-                              <p className="font-bold text-[9px] uppercase text-slate-400 mb-1.5 flex items-center">
+                            <div className="space-y-1 sm:border-r border-slate-250 sm:pr-2">
+                              <p className="font-bold text-[9px] uppercase tracking-wider text-slate-400 mb-1.5 flex items-center">
                                 <span className="w-1.5 h-1.5 rounded-full bg-red-400 mr-1.5"></span> Original Row Content
                               </p>
-                              <div className="truncate text-slate-600"><b>Date:</b> {a.rawRow.date || "-"}</div>
-                              <div className="truncate text-slate-600"><b>Description:</b> {a.rawRow.description || "-"}</div>
-                              <div className="truncate text-slate-600"><b>Paid By:</b> {a.rawRow.paid_by || "-"}</div>
-                              <div className="truncate text-slate-600"><b>Amount:</b> {a.rawRow.amount} {a.rawRow.currency || ""}</div>
+                              <div className="truncate text-slate-500"><b>Date:</b> {a.rawRow.date || "-"}</div>
+                              <div className="truncate text-slate-500"><b>Description:</b> {a.rawRow.description || "-"}</div>
+                              <div className="truncate text-slate-500"><b>Paid By:</b> {a.rawRow.paid_by || "-"}</div>
+                              <div className="truncate text-slate-500"><b>Amount:</b> {a.rawRow.amount} {a.rawRow.currency || ""}</div>
                             </div>
 
                             {/* After (Resolved Output) */}
                             <div className="space-y-1 sm:pl-2">
-                              <p className="font-bold text-[9px] uppercase text-slate-400 mb-1.5 flex items-center">
+                              <p className="font-bold text-[9px] uppercase tracking-wider text-slate-400 mb-1.5 flex items-center">
                                 <span className="w-1.5 h-1.5 rounded-full bg-green-500 mr-1.5"></span> Adjusted Output Ledger
                               </p>
                               {(() => {
@@ -2164,7 +2487,7 @@ export default function App() {
                                 const isSettlement = res?.resolutionAction === "CONVERTED_TO_SETTLEMENT";
                                 
                                 if (isExcluded) {
-                                  return <div className="text-red-650 font-semibold italic py-2">Row Excluded (will not be imported)</div>;
+                                  return <div className="text-red-600 font-semibold italic py-2">Row excluded (will not be imported)</div>;
                                 }
 
                                 let finalDate = a.rawRow.date;
@@ -2179,17 +2502,17 @@ export default function App() {
 
                                 return (
                                   <>
-                                    <div className={`truncate ${res?.resolutionDetails?.selectedDate ? "text-green-600 font-semibold" : "text-slate-600"}`}>
+                                    <div className={`truncate ${res?.resolutionDetails?.selectedDate ? "text-green-600 font-semibold" : "text-slate-500"}`}>
                                       <b>Date:</b> {finalDate}
                                     </div>
-                                    <div className="truncate text-slate-600"><b>Description:</b> {a.rawRow.description || "-"}</div>
-                                    <div className={`truncate ${res?.resolutionAction === "MAPPED_USER" ? "text-green-600 font-semibold" : "text-slate-600"}`}>
-                                      <b>Paid By:</b> {finalPaidBy}
+                                    <div className="truncate text-slate-500"><b>Description:</b> {a.rawRow.description || "-"}</div>
+                                    <div className={`truncate ${res?.resolutionAction === "MAPPED_USER" ? "text-green-600 font-semibold" : "text-slate-500"}`}>
+                                      <b>Paid by:</b> {finalPaidBy}
                                     </div>
-                                    <div className={`truncate ${isSettlement ? "text-blue-650 font-semibold" : "text-slate-600"}`}>
+                                    <div className={`truncate ${isSettlement ? "text-blue-600 font-semibold" : "text-slate-500"}`}>
                                       <b>Type:</b> {isSettlement ? "Settlement" : "Expense"}
                                     </div>
-                                    <div className="truncate text-slate-600">
+                                    <div className="truncate text-slate-500">
                                       <b>Amount:</b> {a.rawRow.amount} {a.rawRow.currency || "INR"}
                                     </div>
                                   </>
@@ -2198,13 +2521,16 @@ export default function App() {
                             </div>
                           </div>
 
-                          {/* Interactive Resolution Panel */}
-                          <div className="flex flex-wrap gap-2 text-xs border-t border-slate-100 pt-3">
-                            {/* Missing Payer */}
-                            {a.anomalyType === "MISSING_PAYER" && (
-                              <div className="space-y-2 w-full">
-                                <p className="text-[10px] text-slate-500 font-bold uppercase">Assign Payer:</p>
-                                <div className="flex flex-wrap gap-2">
+                          {/* Suggested Fix Action Panel */}
+                          <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-2.5">
+                            <div className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">
+                              Suggested fix: <span className="font-normal normal-case text-slate-600">{fixText}</span>
+                            </div>
+
+                            <div className="flex flex-wrap gap-2">
+                              {/* Missing Payer */}
+                              {a.anomalyType === "MISSING_PAYER" && (
+                                <div className="flex flex-wrap gap-2 w-full">
                                   {selectedGroup.memberships.map(m => (
                                     <button
                                       key={m.id}
@@ -2212,23 +2538,19 @@ export default function App() {
                                       className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
                                         resolution?.resolutionDetails?.to === m.user.name
                                           ? "bg-blue-600 border-blue-500 text-white"
-                                          : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
+                                          : "bg-white border-slate-300 hover:bg-slate-100 text-slate-700"
                                       }`}
                                     >
                                       {m.user.name}
                                     </button>
                                   ))}
                                 </div>
-                              </div>
-                            )}
+                              )}
 
-                            {/* Unknown User Mapping */}
-                            {a.anomalyType === "UNKNOWN_USER" && (
-                              <div className="space-y-2 w-full">
-                                <p className="text-[10px] text-slate-500 font-bold uppercase">Map to Existing member:</p>
-                                <div className="flex flex-wrap gap-2">
+                              {/* Unknown User Mapping */}
+                              {a.anomalyType === "UNKNOWN_USER" && (
+                                <div className="flex flex-wrap gap-2 w-full">
                                   {selectedGroup.memberships.map(m => {
-                                    // Robust name resolver that matches text correctly without breaking on special chars
                                     const match = a.description.match(/Unknown user '(.+)' detected/);
                                     const rawName = match ? match[1] : a.rawRow.paid_by || "";
                                     return (
@@ -2238,7 +2560,7 @@ export default function App() {
                                         className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
                                           resolution?.resolutionDetails?.to === m.user.name
                                             ? "bg-blue-600 border-blue-500 text-white"
-                                            : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
+                                            : "bg-white border-slate-300 hover:bg-slate-100 text-slate-700"
                                         }`}
                                       >
                                         {m.user.name}
@@ -2246,14 +2568,11 @@ export default function App() {
                                     );
                                   })}
                                 </div>
-                              </div>
-                            )}
+                              )}
 
-                            {/* Ambiguous Date Selector */}
-                            {a.anomalyType === "AMBIGUOUS_DATE" && (
-                              <div className="space-y-2 w-full">
-                                <p className="text-[10px] text-slate-500 font-bold uppercase">Confirm Date interpretation:</p>
-                                <div className="flex flex-wrap gap-2">
+                              {/* Ambiguous Date Selector */}
+                              {a.anomalyType === "AMBIGUOUS_DATE" && (
+                                <div className="flex flex-wrap gap-2 w-full">
                                   {(() => {
                                     const match = a.rawRow.date.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
                                     if (!match) return null;
@@ -2270,7 +2589,7 @@ export default function App() {
                                           className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
                                             resolution?.resolutionDetails?.selectedDate === d1
                                               ? "bg-blue-600 border-blue-500 text-white"
-                                              : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
+                                              : "bg-white border-slate-300 hover:bg-slate-100 text-slate-700"
                                           }`}
                                         >
                                           {label1} (DD-MM)
@@ -2280,7 +2599,7 @@ export default function App() {
                                           className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
                                             resolution?.resolutionDetails?.selectedDate === d2
                                               ? "bg-blue-600 border-blue-500 text-white"
-                                              : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
+                                              : "bg-white border-slate-300 hover:bg-slate-100 text-slate-700"
                                           }`}
                                         >
                                           {label2} (MM-DD)
@@ -2289,113 +2608,392 @@ export default function App() {
                                     );
                                   })()}
                                 </div>
-                              </div>
-                            )}
+                              )}
 
-                            {/* Repayment Disguised */}
-                            {a.anomalyType === "SETTLEMENT_DISGUISED_AS_EXPENSE" && (
-                              <div className="flex space-x-2">
-                                <button 
-                                  onClick={() => handleResolveAnomaly(a.fingerprint, "CONVERTED_TO_SETTLEMENT")}
-                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
-                                    resolution?.resolutionAction === "CONVERTED_TO_SETTLEMENT"
-                                      ? "bg-blue-600 border-blue-550 text-white"
-                                      : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
-                                  }`}
-                                >
-                                  Convert to Settlement
-                                </button>
-                                <button 
-                                  onClick={() => handleResolveAnomaly(a.fingerprint, "ACCEPTED_WARNING")}
-                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
-                                    resolution?.resolutionAction === "ACCEPTED_WARNING"
-                                      ? "bg-slate-200 border-slate-300 text-slate-800"
-                                      : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
-                                  }`}
-                                >
-                                  Keep as regular Expense
-                                </button>
-                              </div>
-                            )}
+                              {/* Repayment Disguised */}
+                              {a.anomalyType === "SETTLEMENT_DISGUISED_AS_EXPENSE" && (
+                                <div className="flex space-x-2">
+                                  <button 
+                                    onClick={() => handleResolveAnomaly(a.fingerprint, "CONVERTED_TO_SETTLEMENT")}
+                                    className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
+                                      resolution?.resolutionAction === "CONVERTED_TO_SETTLEMENT"
+                                        ? "bg-blue-600 border-blue-500 text-white"
+                                        : "bg-white border-slate-300 hover:bg-slate-100 text-slate-700"
+                                    }`}
+                                  >
+                                    Convert to repayment
+                                  </button>
+                                  <button 
+                                    onClick={() => handleResolveAnomaly(a.fingerprint, "ACCEPTED_WARNING")}
+                                    className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
+                                      resolution?.resolutionAction === "ACCEPTED_WARNING"
+                                        ? "bg-slate-200 border-slate-300 text-slate-800"
+                                        : "bg-white border-slate-300 hover:bg-slate-100 text-slate-750"
+                                    }`}
+                                  >
+                                    Keep as expense
+                                  </button>
+                                </div>
+                              )}
 
-                            {/* Duplicate checking */}
-                            {a.anomalyType === "DUPLICATE" && (
-                              <div className="flex space-x-2">
-                                <button 
-                                  onClick={() => handleResolveAnomaly(a.fingerprint, "REJECT_ROW")}
-                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
-                                    resolution?.resolutionAction === "REJECT_ROW"
-                                      ? "bg-red-650 border-red-500 text-white"
-                                      : "bg-white border-slate-300 hover:bg-slate-50 text-red-650"
-                                  }`}
-                                >
-                                  Discard Duplicate Row
-                                </button>
-                                <button 
-                                  onClick={() => handleResolveAnomaly(a.fingerprint, "APPROVED_DUPLICATE")}
-                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
-                                    resolution?.resolutionAction === "APPROVED_DUPLICATE"
-                                      ? "bg-green-600 border-green-500 text-white"
-                                      : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
-                                  }`}
-                                >
-                                  Approve Duplicate
-                                </button>
-                              </div>
-                            )}
-
-                            {/* Safe Warnings */}
-                            {["MISSING_CURRENCY", "NEGATIVE_AMOUNT", "ZERO_AMOUNT", "MEMBERSHIP_VIOLATION"].includes(a.anomalyType) && (
-                              <div className="flex space-x-2">
-                                <button 
-                                  onClick={() => handleResolveAnomaly(a.fingerprint, "ACCEPTED_WARNING")}
-                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
-                                    resolution?.resolutionAction === "ACCEPTED_WARNING"
-                                      ? "bg-blue-600 border-blue-500 text-white"
-                                      : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
-                                  }`}
-                                >
-                                  Acknowledge & Accept
-                                </button>
-                                {a.anomalyType === "MEMBERSHIP_VIOLATION" && (
+                              {/* Duplicate checking */}
+                              {a.anomalyType === "DUPLICATE" && (
+                                <div className="flex space-x-2">
                                   <button 
                                     onClick={() => handleResolveAnomaly(a.fingerprint, "REJECT_ROW")}
                                     className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
                                       resolution?.resolutionAction === "REJECT_ROW"
-                                        ? "bg-red-650 border-red-500 text-white"
-                                        : "bg-white border-slate-300 hover:bg-slate-50 text-red-650"
+                                        ? "bg-red-600 border-red-500 text-white"
+                                        : "bg-white border-slate-300 hover:bg-slate-100 text-red-600"
                                     }`}
                                   >
-                                    Exclude Row
+                                    Discard duplicate
                                   </button>
-                                )}
-                              </div>
-                            )}
+                                  <button 
+                                    onClick={() => handleResolveAnomaly(a.fingerprint, "APPROVED_DUPLICATE")}
+                                    className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
+                                      resolution?.resolutionAction === "APPROVED_DUPLICATE"
+                                        ? "bg-green-600 border-green-500 text-white"
+                                        : "bg-white border-slate-300 hover:bg-slate-100 text-slate-700"
+                                    }`}
+                                  >
+                                    Force import
+                                  </button>
+                                </div>
+                              )}
 
-                            {/* Manual Exclude Button for other types */}
-                            {!["DUPLICATE", "MEMBERSHIP_VIOLATION"].includes(a.anomalyType) && (
-                              <button
-                                onClick={() => handleResolveAnomaly(a.fingerprint, "REJECT_ROW")}
-                                className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
-                                  resolution?.resolutionAction === "REJECT_ROW"
-                                    ? "bg-red-650 border-red-500 text-white"
-                                    : "bg-white border-slate-300 hover:bg-red-50 hover:text-red-600 text-slate-600 ml-auto"
-                                }`}
-                              >
-                                Exclude Row
-                              </button>
-                            )}
+                              {/* Safe Warnings */}
+                              {["MISSING_CURRENCY", "NEGATIVE_AMOUNT", "ZERO_AMOUNT", "MEMBERSHIP_VIOLATION"].includes(a.anomalyType) && (
+                                <div className="flex space-x-2">
+                                  <button 
+                                    onClick={() => handleResolveAnomaly(a.fingerprint, "ACCEPTED_WARNING")}
+                                    className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
+                                      resolution?.resolutionAction === "ACCEPTED_WARNING"
+                                        ? "bg-blue-600 border-blue-500 text-white"
+                                        : "bg-white border-slate-300 hover:bg-slate-100 text-slate-700"
+                                    }`}
+                                  >
+                                    Acknowledge & accept
+                                  </button>
+                                  {a.anomalyType === "MEMBERSHIP_VIOLATION" && (
+                                    <button 
+                                      onClick={() => handleResolveAnomaly(a.fingerprint, "REJECT_ROW")}
+                                      className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
+                                        resolution?.resolutionAction === "REJECT_ROW"
+                                          ? "bg-red-600 border-red-500 text-white"
+                                          : "bg-white border-slate-300 hover:bg-slate-100 text-red-600"
+                                      }`}
+                                    >
+                                      Exclude row
+                                    </button>
+                                  )}
+                                </div>
+                              )}
 
+                              {/* Invalid Percentage Split Suggested Fixes */}
+                              {a.anomalyType === "INVALID_PERCENT_SPLIT" && (
+                                <div className="space-y-4 w-full">
+                                  {/* Quick Actions */}
+                                  <div className="flex flex-wrap gap-2">
+                                    <button
+                                      onClick={() => {
+                                        const details = (a.normalizedRow.splitDetails || {}) as Record<string, number>;
+                                        const sum = Object.values(details).reduce((x: number, y: number) => x + y, 0);
+                                        const keys = Object.keys(details);
+                                        const newDetails: Record<string, number> = {};
+                                        if (sum === 0) {
+                                          const eq = parseFloat((100 / keys.length).toFixed(2));
+                                          let s = 0;
+                                          keys.forEach((k, idx) => {
+                                            if (idx === keys.length - 1) newDetails[k] = parseFloat((100 - s).toFixed(2));
+                                            else { newDetails[k] = eq; s += eq; }
+                                          });
+                                        } else {
+                                          let s = 0;
+                                          keys.forEach((k, idx) => {
+                                            if (idx === keys.length - 1) newDetails[k] = parseFloat((100 - s).toFixed(2));
+                                            else {
+                                              const val = parseFloat(((details[k] / sum) * 100).toFixed(2));
+                                              newDetails[k] = val;
+                                              s += val;
+                                            }
+                                          });
+                                        }
+                                        handleResolveAnomaly(a.fingerprint, "CORRECTED_PERCENT_SPLIT", { correctedSplitDetails: newDetails, resolutionMethod: "proportional" });
+                                      }}
+                                      className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold cursor-pointer transition-all ${
+                                        resolution?.resolutionAction === "CORRECTED_PERCENT_SPLIT" && resolution?.resolutionDetails?.resolutionMethod === "proportional"
+                                          ? "bg-blue-600 border-blue-500 text-white"
+                                          : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
+                                      }`}
+                                    >
+                                      Proportional Auto-normalize
+                                    </button>
+
+                                    <button
+                                      onClick={() => {
+                                        const details = (a.normalizedRow.splitDetails || {}) as Record<string, number>;
+                                        const sum = Object.values(details).reduce((x: number, y: number) => x + y, 0);
+                                        const keys = Object.keys(details);
+                                        const diff = 100 - sum;
+                                        const share = diff / keys.length;
+                                        const newDetails: Record<string, number> = {};
+                                        let s = 0;
+                                        keys.forEach((k, idx) => {
+                                          if (idx === keys.length - 1) newDetails[k] = parseFloat((100 - s).toFixed(2));
+                                          else {
+                                            const val = parseFloat((details[k] + share).toFixed(2));
+                                            newDetails[k] = val;
+                                            s += val;
+                                          }
+                                        });
+                                        handleResolveAnomaly(a.fingerprint, "CORRECTED_PERCENT_SPLIT", { correctedSplitDetails: newDetails, resolutionMethod: "distribute" });
+                                      }}
+                                      className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold cursor-pointer transition-all ${
+                                        resolution?.resolutionAction === "CORRECTED_PERCENT_SPLIT" && resolution?.resolutionDetails?.resolutionMethod === "distribute"
+                                          ? "bg-blue-600 border-blue-500 text-white"
+                                          : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
+                                      }`}
+                                    >
+                                      Distribute Remainder
+                                    </button>
+
+                                    <button
+                                      onClick={() => {
+                                        const details = (a.normalizedRow.splitDetails || {}) as Record<string, number>;
+                                        const keys = Object.keys(details);
+                                        const eq = parseFloat((100 / keys.length).toFixed(2));
+                                        const newDetails: Record<string, number> = {};
+                                        let s = 0;
+                                        keys.forEach((k, idx) => {
+                                          if (idx === keys.length - 1) newDetails[k] = parseFloat((100 - s).toFixed(2));
+                                          else { newDetails[k] = eq; s += eq; }
+                                        });
+                                        handleResolveAnomaly(a.fingerprint, "CORRECTED_PERCENT_SPLIT", { correctedSplitDetails: newDetails, resolutionMethod: "equal" });
+                                      }}
+                                      className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold cursor-pointer transition-all ${
+                                        resolution?.resolutionAction === "CORRECTED_PERCENT_SPLIT" && resolution?.resolutionDetails?.resolutionMethod === "equal"
+                                          ? "bg-blue-600 border-blue-500 text-white"
+                                          : "bg-white border-slate-300 hover:bg-slate-50 text-slate-700"
+                                      }`}
+                                    >
+                                      Split Equally
+                                    </button>
+                                  </div>
+
+                                  {/* Manual editor */}
+                                  <div className="border border-slate-200 rounded-lg p-3 bg-white space-y-2.5">
+                                    <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Manual Adjustment (Target: 100%)</div>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                      {Object.keys(a.normalizedRow.splitDetails || {}).map(member => {
+                                        const details = (resolution?.resolutionDetails?.correctedSplitDetails || a.normalizedRow.splitDetails || {}) as Record<string, number>;
+                                        const val = details[member] !== undefined ? details[member] : 0;
+                                        return (
+                                          <div key={member} className="flex items-center justify-between border border-slate-100 rounded p-1.5 text-[11px]">
+                                            <span className="font-semibold text-slate-700">{member}</span>
+                                            <div className="flex items-center space-x-1">
+                                              <input
+                                                type="number"
+                                                step="0.01"
+                                                value={val}
+                                                onChange={(e) => {
+                                                  const newDetails = {
+                                                    ...((resolution?.resolutionDetails?.correctedSplitDetails || a.normalizedRow.splitDetails || {}) as Record<string, number>),
+                                                    [member]: parseFloat(e.target.value) || 0
+                                                  };
+                                                  handleResolveAnomaly(a.fingerprint, "CORRECTED_PERCENT_SPLIT", { correctedSplitDetails: newDetails, resolutionMethod: "manual" });
+                                                }}
+                                                className="w-16 border border-slate-200 rounded px-1.5 py-0.5 text-right font-semibold text-slate-800"
+                                              />
+                                              <span className="text-slate-400 font-bold">%</span>
+                                            </div>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                    {(() => {
+                                      const details = (resolution?.resolutionDetails?.correctedSplitDetails || a.normalizedRow.splitDetails || {}) as Record<string, number>;
+                                      const sum = Object.values(details).reduce((x: number, y: number) => x + y, 0);
+                                      const isCorrect = Math.abs(sum - 100) < 0.01;
+                                      return (
+                                        <div className="flex items-center justify-between pt-1 text-xs border-t border-slate-100">
+                                          <span className="font-semibold text-slate-500">Total Sum:</span>
+                                          <span className={`font-extrabold ${isCorrect ? "text-green-600" : "text-red-600"}`}>
+                                            {sum.toFixed(2)}% {isCorrect ? "✓ (Valid)" : `✗ (Must be 100%)`}
+                                          </span>
+                                        </div>
+                                      );
+                                    })()}
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Invalid Exact Split Suggested Fixes */}
+                              {a.anomalyType === "INVALID_EXACT_SPLIT" && (
+                                <div className="space-y-4 w-full">
+                                  {/* Quick Actions */}
+                                  <div className="flex flex-wrap gap-2">
+                                    <button
+                                      onClick={() => {
+                                        const details = (a.normalizedRow.splitDetails || {}) as Record<string, number>;
+                                        const sum = Object.values(details).reduce((x: number, y: number) => x + y, 0);
+                                        const total = a.normalizedRow.originalAmount || 0;
+                                        const keys = Object.keys(details);
+                                        const newDetails: Record<string, number> = {};
+                                        if (sum === 0) {
+                                          const eq = parseFloat((total / keys.length).toFixed(2));
+                                          let s = 0;
+                                          keys.forEach((k, idx) => {
+                                            if (idx === keys.length - 1) newDetails[k] = parseFloat((total - s).toFixed(2));
+                                            else { newDetails[k] = eq; s += eq; }
+                                          });
+                                        } else {
+                                          let s = 0;
+                                          keys.forEach((k, idx) => {
+                                            if (idx === keys.length - 1) newDetails[k] = parseFloat((total - s).toFixed(2));
+                                            else {
+                                              const val = parseFloat(((details[k] / sum) * total).toFixed(2));
+                                              newDetails[k] = val;
+                                              s += val;
+                                            }
+                                          });
+                                        }
+                                        handleResolveAnomaly(a.fingerprint, "CORRECTED_PERCENT_SPLIT", { correctedSplitDetails: newDetails, resolutionMethod: "proportional" });
+                                      }}
+                                      className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold cursor-pointer transition-all ${
+                                        resolution?.resolutionAction === "CORRECTED_PERCENT_SPLIT" && resolution?.resolutionDetails?.resolutionMethod === "proportional"
+                                          ? "bg-blue-600 border-blue-500 text-white"
+                                          : "bg-white border-slate-300 hover:bg-slate-55 text-slate-700"
+                                      }`}
+                                    >
+                                      Proportional Auto-normalize
+                                    </button>
+
+                                    <button
+                                      onClick={() => {
+                                        const details = (a.normalizedRow.splitDetails || {}) as Record<string, number>;
+                                        const sum = Object.values(details).reduce((x: number, y: number) => x + y, 0);
+                                        const total = a.normalizedRow.originalAmount || 0;
+                                        const keys = Object.keys(details);
+                                        const diff = total - sum;
+                                        const share = diff / keys.length;
+                                        const newDetails: Record<string, number> = {};
+                                        let s = 0;
+                                        keys.forEach((k, idx) => {
+                                          if (idx === keys.length - 1) newDetails[k] = parseFloat((total - s).toFixed(2));
+                                          else {
+                                            const val = parseFloat((details[k] + share).toFixed(2));
+                                            newDetails[k] = val;
+                                            s += val;
+                                          }
+                                        });
+                                        handleResolveAnomaly(a.fingerprint, "CORRECTED_PERCENT_SPLIT", { correctedSplitDetails: newDetails, resolutionMethod: "distribute" });
+                                      }}
+                                      className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold cursor-pointer transition-all ${
+                                        resolution?.resolutionAction === "CORRECTED_PERCENT_SPLIT" && resolution?.resolutionDetails?.resolutionMethod === "distribute"
+                                          ? "bg-blue-600 border-blue-500 text-white"
+                                          : "bg-white border-slate-300 hover:bg-slate-55 text-slate-700"
+                                      }`}
+                                    >
+                                      Distribute Remainder
+                                    </button>
+
+                                    <button
+                                      onClick={() => {
+                                        const details = (a.normalizedRow.splitDetails || {}) as Record<string, number>;
+                                        const total = a.normalizedRow.originalAmount || 0;
+                                        const keys = Object.keys(details);
+                                        const eq = parseFloat((total / keys.length).toFixed(2));
+                                        const newDetails: Record<string, number> = {};
+                                        let s = 0;
+                                        keys.forEach((k, idx) => {
+                                          if (idx === keys.length - 1) newDetails[k] = parseFloat((total - s).toFixed(2));
+                                          else { newDetails[k] = eq; s += eq; }
+                                        });
+                                        handleResolveAnomaly(a.fingerprint, "CORRECTED_PERCENT_SPLIT", { correctedSplitDetails: newDetails, resolutionMethod: "equal" });
+                                      }}
+                                      className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold cursor-pointer transition-all ${
+                                        resolution?.resolutionAction === "CORRECTED_PERCENT_SPLIT" && resolution?.resolutionDetails?.resolutionMethod === "equal"
+                                          ? "bg-blue-600 border-blue-500 text-white"
+                                          : "bg-white border-slate-300 hover:bg-slate-55 text-slate-700"
+                                      }`}
+                                    >
+                                      Split Equally
+                                    </button>
+                                  </div>
+
+                                  {/* Manual editor */}
+                                  <div className="border border-slate-200 rounded-lg p-3 bg-white space-y-2.5">
+                                    <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Manual Adjustment (Target: ₹{a.normalizedRow.originalAmount})</div>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                      {Object.keys(a.normalizedRow.splitDetails || {}).map(member => {
+                                        const details = (resolution?.resolutionDetails?.correctedSplitDetails || a.normalizedRow.splitDetails || {}) as Record<string, number>;
+                                        const val = details[member] !== undefined ? details[member] : 0;
+                                        return (
+                                          <div key={member} className="flex items-center justify-between border border-slate-100 rounded p-1.5 text-[11px]">
+                                            <span className="font-semibold text-slate-700">{member}</span>
+                                            <div className="flex items-center space-x-1">
+                                              <span className="text-slate-400 font-bold">₹</span>
+                                              <input
+                                                type="number"
+                                                step="0.01"
+                                                value={val}
+                                                onChange={(e) => {
+                                                  const newDetails = {
+                                                    ...((resolution?.resolutionDetails?.correctedSplitDetails || a.normalizedRow.splitDetails || {}) as Record<string, number>),
+                                                    [member]: parseFloat(e.target.value) || 0
+                                                  };
+                                                  handleResolveAnomaly(a.fingerprint, "CORRECTED_PERCENT_SPLIT", { correctedSplitDetails: newDetails, resolutionMethod: "manual" });
+                                                }}
+                                                className="w-16 border border-slate-200 rounded px-1.5 py-0.5 text-right font-semibold text-slate-800"
+                                              />
+                                            </div>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                    {(() => {
+                                      const details = (resolution?.resolutionDetails?.correctedSplitDetails || a.normalizedRow.splitDetails || {}) as Record<string, number>;
+                                      const sum = Object.values(details).reduce((x: number, y: number) => x + y, 0);
+                                      const total = a.normalizedRow.originalAmount || 0;
+                                      const isCorrect = Math.abs(sum - total) < 0.01;
+                                      return (
+                                        <div className="flex items-center justify-between pt-1 text-xs border-t border-slate-100">
+                                          <span className="font-semibold text-slate-500">Total Sum:</span>
+                                          <span className={`font-extrabold ${isCorrect ? "text-green-600" : "text-red-600"}`}>
+                                            ₹{sum.toFixed(2)} {isCorrect ? "✓ (Valid)" : `✗ (Must be ₹${total})`}
+                                          </span>
+                                        </div>
+                                      );
+                                    })()}
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Manual Exclude Button for other types */}
+                              {!["DUPLICATE", "MEMBERSHIP_VIOLATION"].includes(a.anomalyType) && (
+                                <button
+                                  onClick={() => handleResolveAnomaly(a.fingerprint, "REJECT_ROW")}
+                                  className={`px-3 py-1.5 rounded-lg border font-semibold cursor-pointer transition-all ${
+                                    resolution?.resolutionAction === "REJECT_ROW"
+                                      ? "bg-red-600 border-red-500 text-white"
+                                      : "bg-white border-slate-300 hover:bg-red-50 hover:text-red-600 text-slate-500 ml-auto"
+                                  }`}
+                                >
+                                  Exclude row
+                                </button>
+                              )}
+                            </div>
                           </div>
 
                           {/* Notes */}
-                          <div className="mt-3.5">
+                          <div className="mt-3">
                             <input 
                               type="text" 
                               value={resolution?.resolutionNote || ""}
                               onChange={e => handleResolveNote(a.fingerprint, e.target.value)}
-                              placeholder="Add resolution explanation audit trail note..."
-                              className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-xs focus:outline-none"
+                              placeholder="Audit trail note: explain why you resolved it this way..."
+                              className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-[11px] font-medium focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600 text-slate-700"
                             />
                           </div>
 
@@ -2409,8 +3007,8 @@ export default function App() {
                 <div className="space-y-6">
                   {/* Final control */}
                   <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm space-y-4">
-                    <h3 className="font-bold text-base text-slate-800">Reconciliation Controls</h3>
-                    <div className="text-xs text-slate-500 space-y-2">
+                    <h3 className="font-semibold text-sm text-slate-800">Reconciliation controls</h3>
+                    <div className="text-xs text-slate-550 space-y-2 font-medium">
                       <div className="flex justify-between">
                         <span>Total anomalies:</span>
                         <span className="font-bold text-slate-800">{activeImportAnomalies.length}</span>
@@ -2424,29 +3022,29 @@ export default function App() {
                     </div>
                     <button 
                       onClick={handleFinalizeImport}
-                      className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 rounded-lg cursor-pointer text-xs transition-colors shadow-sm"
+                      className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 rounded-lg cursor-pointer text-xs transition-colors shadow-sm"
                     >
-                      Persist Resolved Data & Generate Report
+                      Commit adjustments & finalize
                     </button>
                   </div>
 
                   {/* Diagnostics Panel (Human Readable Format) */}
-                  <div className="bg-slate-950 text-slate-200 rounded-xl p-5 shadow-sm space-y-4 font-mono text-[10px]">
-                    <h4 className="font-bold border-b border-slate-855 pb-2 text-slate-400 flex items-center">
-                      <Database className="w-3.5 h-3.5 mr-1" /> Pipeline Diagnostics
+                  <div className="bg-slate-900 text-slate-300 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4 font-mono text-[10px] leading-relaxed">
+                    <h4 className="font-semibold border-b border-slate-800 pb-2 text-slate-400 flex items-center">
+                      <Database className="w-3.5 h-3.5 mr-1.5" strokeWidth={1.5} /> Pipeline diagnostics
                     </h4>
-                    <div className="space-y-3 max-h-[300px] overflow-y-auto pr-1">
+                    <div className="space-y-3.5 max-h-[300px] overflow-y-auto pr-1 custom-scrollbar">
                       {diagnosticsLogs.length === 0 ? (
                         <p className="text-slate-500">Awaiting import pipeline start...</p>
                       ) : (
                         diagnosticsLogs.map((log, idx) => {
                           const keys = Object.keys(log.details || {});
                           return (
-                            <div key={idx} className="space-y-1 border-b border-slate-850 pb-2">
-                              <div className="flex items-center justify-between text-blue-400">
+                            <div key={idx} className="space-y-1 border-b border-slate-800/80 pb-2.5 last:border-0 last:pb-0">
+                              <div className="flex items-center justify-between text-blue-400 font-bold">
                                 <span>[{log.timestamp}] STAGE: {log.stage}</span>
                               </div>
-                              <div className="text-slate-400 pl-2 space-y-0.5">
+                              <div className="text-slate-400 pl-2 space-y-0.5 font-medium">
                                 {keys.map(k => {
                                   const val = log.details[k];
                                   const displayVal = typeof val === "object" && val !== null
@@ -2454,7 +3052,7 @@ export default function App() {
                                     : String(val);
                                   return (
                                     <div key={k}>
-                                      • {k}: <b className="text-slate-300">{displayVal}</b>
+                                      • {k}: <span className="text-slate-200">{displayVal}</span>
                                     </div>
                                   );
                                 })}
@@ -2466,7 +3064,6 @@ export default function App() {
                     </div>
                   </div>
                 </div>
-
               </div>
             )}
           </div>
@@ -2478,12 +3075,12 @@ export default function App() {
             <div className="flex items-center justify-between border-b border-slate-200 pb-4">
               <button 
                 onClick={() => setView("dashboard")}
-                className="text-slate-500 hover:text-slate-800 flex items-center text-sm font-semibold transition-colors cursor-pointer"
+                className="text-slate-500 hover:text-slate-800 flex items-center text-xs font-semibold transition-colors cursor-pointer"
               >
-                <ArrowRight className="w-4 h-4 mr-1 rotate-180" /> Back to Dashboard
+                <ArrowRight className="w-4 h-4 mr-1 rotate-180" /> Back to dashboard
               </button>
-              <h2 className="text-xl font-bold text-slate-900 flex items-center">
-                <ShieldAlert className="w-5 h-5 mr-2 text-blue-600" /> Admin Walkthrough Diagnostics
+              <h2 className="text-sm font-semibold text-slate-905 flex items-center">
+                <ShieldAlert className="w-5 h-5 mr-2 text-blue-600" /> Admin walkthrough diagnostics
               </h2>
             </div>
 
@@ -2494,27 +3091,37 @@ export default function App() {
                 
                 {/* Audit Logs */}
                 <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-                  <h3 className="font-bold text-base text-slate-800 mb-4 flex items-center">
-                    <History className="w-4 h-4 mr-2 text-slate-500" /> Audit Resolution Logs
+                  <h3 className="font-semibold text-sm text-slate-800 mb-4 flex items-center">
+                    <History className="w-4 h-4 mr-2 text-slate-400" /> Audit resolution logs
                   </h3>
 
-                  <div className="space-y-3 max-h-[400px] overflow-y-auto pr-1">
+                  <div className="space-y-3 max-h-[400px] overflow-y-auto pr-1 custom-scrollbar">
                     {adminDemoData.auditLogs.length === 0 ? (
-                      <p className="text-xs text-slate-400">No audit logs written.</p>
+                      <p className="text-xs text-slate-400 py-4 text-center font-medium">No audit logs written.</p>
                     ) : (
                       adminDemoData.auditLogs.map(log => (
-                        <div key={log.id} className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-2">
-                          <div className="flex justify-between text-[10px] text-slate-450">
-                            <span>ACTION: <b>{log.action}</b></span>
-                            <span>{new Date(log.createdAt).toLocaleString()}</span>
+                        <div key={log.id} className="p-4 bg-slate-50 border border-slate-200 rounded-xl text-xs space-y-2 font-medium">
+                          <div className="flex justify-between text-[10px] text-slate-450 font-bold border-b border-slate-100 pb-1.5">
+                            <span>Action: <b>{log.action.toLowerCase().replace(/_/g, ' ')}</b></span>
+                            <span>{new Date(log.createdAt).toLocaleString("en-IN")}</span>
                           </div>
-                          <p className="font-medium text-slate-800">
-                            Entity: {log.entityType} ({log.entityId})
+                          <p className="text-slate-800">
+                            Entity: <span className="font-bold">{log.entityType}</span> ({log.entityId})
                           </p>
-                          {log.afterState && (
-                            <pre className="p-2 bg-slate-900 text-slate-200 rounded overflow-x-auto text-[9px]">
-                              {JSON.stringify(log.afterState, null, 2)}
-                            </pre>
+                          {log.afterState && typeof log.afterState === "object" && (
+                            <div className="mt-3 bg-white border border-slate-150 rounded-lg p-3 space-y-1.5 shadow-sm text-[10px] font-medium text-slate-600">
+                              {Object.entries(log.afterState).map(([key, val]) => {
+                                const displayVal = typeof val === "object" && val !== null
+                                  ? Array.isArray(val) ? `[${val.length} items]` : "{details}"
+                                  : String(val);
+                                return (
+                                  <div key={key} className="flex justify-between border-b border-slate-50 last:border-0 pb-1 last:pb-0">
+                                    <span className="text-slate-400">{key.replace(/([A-Z])/g, ' $1').toLowerCase()}</span>
+                                    <span className="text-slate-850 font-semibold truncate max-w-[220px]" title={displayVal}>{displayVal}</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
                           )}
                         </div>
                       ))
@@ -2524,24 +3131,26 @@ export default function App() {
 
                 {/* Import Job Diagnostics details */}
                 <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-                  <h3 className="font-bold text-base text-slate-800 mb-4 flex items-center">
-                    <FileText className="w-4 h-4 mr-2 text-slate-500" /> Import Anomaly Files Details
+                  <h3 className="font-semibold text-sm text-slate-800 mb-4 flex items-center">
+                    <FileText className="w-4 h-4 mr-2 text-slate-400" /> Import anomaly files details
                   </h3>
                   <div className="space-y-4">
                     {adminDemoData.importJobs.map(job => (
-                      <div key={job.id} className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3 text-xs">
-                        <div className="flex items-center justify-between">
-                          <h4 className="font-bold text-slate-800">{job.rawFileName}</h4>
-                          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-100 text-blue-800">{job.status}</span>
+                      <div key={job.id} className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3 text-xs font-medium">
+                        <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+                          <h4 className="font-bold text-slate-800 text-[13px]">{job.rawFileName}</h4>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                            job.status === "COMPLETED" ? "bg-green-50 border-green-200 text-green-700" : "bg-blue-50 border-blue-200 text-blue-700"
+                          }`}>{job.status.toLowerCase()}</span>
                         </div>
-                        <p className="text-[10px] text-slate-400">File Hash: {job.rawFileHash}</p>
+                        <p className="text-[10px] text-slate-450">File hash: <span className="font-mono">{job.rawFileHash}</span></p>
                         {job.anomalies && job.anomalies.length > 0 && (
-                          <div className="space-y-2 pl-3 border-l-2 border-slate-200">
-                            <p className="font-semibold text-slate-500 text-[10px] uppercase">Anomalies Resolved:</p>
+                          <div className="space-y-2 pl-3 border-l-2 border-slate-200 pt-1">
+                            <p className="font-bold text-slate-400 text-[9px] uppercase tracking-wider mb-1.5">Anomalies resolved</p>
                             {job.anomalies.map(a => (
-                              <div key={a.id} className="text-[11px] text-slate-700">
-                                Row {a.rowNumber} ({a.anomalyType}): {a.description} 
-                                {a.resolutionAction && <b className="text-green-600"> $\rightarrow$ Resolved ({a.resolutionAction})</b>}
+                              <div key={a.id} className="text-[11px] text-slate-705 leading-relaxed">
+                                Row {a.rowNumber} ({a.anomalyType.toLowerCase().replace(/_/g, ' ')}): {a.description} 
+                                {a.resolutionAction && <b className="text-green-600"> $\rightarrow$ Resolved: {a.resolutionAction.toLowerCase().replace(/_/g, ' ')}</b>}
                               </div>
                             ))}
                           </div>
@@ -2555,23 +3164,23 @@ export default function App() {
 
               {/* Right Side: Membership soft delete logs */}
               <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm h-fit">
-                <h3 className="font-bold text-base text-slate-800 mb-4 flex items-center">
-                  <Calendar className="w-4 h-4 mr-2 text-slate-500" /> Membership Active Periods
+                <h3 className="font-semibold text-sm text-slate-800 mb-4 flex items-center">
+                  <Calendar className="w-4 h-4 mr-2 text-slate-400" /> Membership active periods
                 </h3>
-                <div className="space-y-3 max-h-[500px] overflow-y-auto pr-1">
+                <div className="space-y-3 max-h-[500px] overflow-y-auto pr-1 custom-scrollbar">
                   {adminDemoData.memberships.map(m => (
-                    <div key={m.id} className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-1">
+                    <div key={m.id} className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-1 font-medium">
                       <div className="flex justify-between font-bold text-slate-800">
                         <span>{m.user.name}</span>
-                        <span className={`px-2 py-0.5 rounded text-[9px] font-bold ${
-                          m.leftAt ? "bg-red-100 text-red-800" : "bg-green-100 text-green-800"
+                        <span className={`px-2 py-0.5 rounded text-[9px] font-bold border ${
+                          m.leftAt ? "bg-red-50 border-red-200 text-red-700" : "bg-green-50 border-green-200 text-green-700"
                         }`}>
                           {m.leftAt ? "Inactive" : "Active"}
                         </span>
                       </div>
                       <p className="text-[10px] text-slate-500">Group: {m.group.name}</p>
-                      <p className="text-[10px] text-slate-400">Joined: {new Date(m.joinedAt).toLocaleDateString()}</p>
-                      {m.leftAt && <p className="text-[10px] text-rose-600">Left: {new Date(m.leftAt).toLocaleDateString()}</p>}
+                      <p className="text-[10px] text-slate-400">Joined: {new Date(m.joinedAt).toLocaleDateString("en-IN")}</p>
+                      {m.leftAt && <p className="text-[10px] text-rose-600 font-semibold">Left: {new Date(m.leftAt).toLocaleDateString("en-IN")}</p>}
                     </div>
                   ))}
                 </div>
@@ -2638,7 +3247,7 @@ export default function App() {
                       </div>
 
                       <span className={`font-bold min-w-[70px] text-right ${
-                        net > 0 ? "text-green-600" : net < 0 ? "text-red-650" : "text-slate-550"
+                        net > 0 ? "text-green-600" : net < 0 ? "text-red-600" : "text-slate-500"
                       }`}>
                         {net > 0 ? "+" : ""}{net.toLocaleString("en-IN")}
                       </span>
@@ -2651,7 +3260,7 @@ export default function App() {
             <div className="border-t border-slate-200 pt-4 mt-4 flex justify-between items-center">
               <span className="text-xs font-bold text-slate-500">Net Ledger Balance:</span>
               <span className={`font-extrabold text-base ${
-                traceUser.netBalance > 0 ? "text-green-650" : traceUser.netBalance < 0 ? "text-red-650" : "text-slate-700"
+                traceUser.netBalance > 0 ? "text-green-600" : traceUser.netBalance < 0 ? "text-red-600" : "text-slate-700"
               }`}>
                 {traceUser.netBalance > 0 ? "+" : ""}{traceUser.netBalance.toLocaleString("en-IN", { style: "currency", currency: "INR" })}
               </span>

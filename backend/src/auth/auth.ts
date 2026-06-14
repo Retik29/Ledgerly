@@ -96,8 +96,18 @@ router.post("/login", async (req, res) => {
 });
 
 // 3. GET /auth/me
-router.get("/me", authMiddleware, (req: AuthenticatedRequest, res: Response) => {
-  return res.json({ user: req.user });
+router.get("/me", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user?.id }
+    });
+    if (!user) {
+      return res.status(401).json({ error: "Session expired or user database record missing." });
+    }
+    return res.json({ user: req.user });
+  } catch (err) {
+    return res.status(500).json({ error: "Failed to verify current user session." });
+  }
 });
 
 // 4. POST /auth/logout

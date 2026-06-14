@@ -102,7 +102,7 @@ function getHash(content: string): string {
 router.post("/upload", async (req: AuthenticatedRequest, res: Response) => {
   let stage: ImportStage = "REQUEST_VALIDATION";
   try {
-    const { filename, csvContent, groupId } = req.body;
+    const { filename, csvContent, groupId, mode } = req.body;
     const userId = req.user?.id;
 
     if (!filename || !csvContent || !groupId || !userId) {
@@ -120,27 +120,44 @@ router.post("/upload", async (req: AuthenticatedRequest, res: Response) => {
       throw new ImportError(stage, "Unauthorized: you are not a member of this group.", 403);
     }
 
-    console.log("[IMPORT] groupId =", groupId);
-    logImportStage(stage, { filename, groupId, bytes: csvContent.length }, { userId });
+    console.log("[IMPORT] groupId =", groupId, "mode =", mode);
+    logImportStage(stage, { filename, groupId, bytes: csvContent.length, mode }, { userId });
 
     // A. Regression protection: check if hash already imported
     stage = "DUPLICATE_CHECK";
     const hash = getHash(csvContent);
+    
     const existingJob = await prisma.importJob.findFirst({
       where: {
         rawFileHash: hash,
-        status: "COMPLETED"
+        status: "COMPLETED",
+        groupId
       }
     });
 
     if (existingJob) {
-      throw new ImportError(
-        stage,
-        `Duplicate import detected. This exact CSV file has already been imported successfully. Job: ${existingJob.id}`,
-        409
-      );
+      if (mode === "PRODUCTION" || !mode) {
+        return res.status(409).json({
+          success: false,
+          error: "DUPLICATE_BATCH",
+          jobId: existingJob.id,
+          message: "This file was already imported earlier."
+        });
+      } else if (mode === "FORCE") {
+        // Log override event
+        await prisma.auditLog.create({
+          data: {
+            entityType: "IMPORT_JOB",
+            entityId: existingJob.id,
+            action: "FORCE_IMPORT_OVERRIDE",
+            performedBy: userId,
+            afterState: JSON.stringify({ filename, hash, groupId })
+          }
+        });
+        console.log(`[FORCE_IMPORT] User ${userId} forced duplicate import for file ${filename} with hash ${hash}`);
+      }
     }
-    logImportStage(stage, { hash }, { duplicate: false });
+    logImportStage(stage, { hash }, { duplicate: !!existingJob });
 
     // B. Parse & normalize CSV
     stage = "CSV_PARSER";

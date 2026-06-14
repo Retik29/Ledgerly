@@ -26,7 +26,10 @@ async function main() {
     { name: "Priya", email: "priya@example.com" },
     { name: "Meera", email: "meera@example.com" },
     { name: "Sam", email: "sam@example.com" },
-    { name: "Dev", email: "dev@example.com" }
+    { name: "Dev", email: "dev@example.com" },
+    { name: "retik", email: "retik@example.com" },
+    { name: "ashmita", email: "ashmita@example.com" },
+    { name: "neha", email: "neha@example.com" }
   ];
 
   const usersMap: { [name: string]: any } = {};

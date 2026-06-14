@@ -66,11 +66,14 @@ model Expense {
   imported         Boolean              @default(false)
   createdAt        DateTime             @default(now())
   deletedAt        DateTime?
+  rowSignature     String?
   
   // Relations
   group        Group                @relation(fields: [groupId], references: [id], onDelete: Cascade)
   payer        User                 @relation("ExpensePayer", fields: [paidBy], references: [id], onDelete: Cascade)
   participants ExpenseParticipant[]
+
+  @@unique([groupId, rowSignature])
 }
 
 model ExpenseParticipant {

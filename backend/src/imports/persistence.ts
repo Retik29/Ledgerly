@@ -4,6 +4,7 @@ import { CsvParser } from "./csvParser";
 import { Normalizer } from "./normalizer";
 import { DecisionEngine, ResolvedAnomaly } from "./decisionEngine";
 import { Decimal } from "@prisma/client/runtime/library";
+import crypto from "crypto";
 
 export interface PersistenceResult {
   expensesCreated: number;
@@ -25,6 +26,23 @@ function jsonStringify(value: unknown): string {
 }
 
 export class PersistenceService {
+  public static computeRowSignature(
+    groupId: string,
+    date: Date | null,
+    amount: number,
+    paidBy: string,
+    splitWith: string[],
+    description: string
+  ): string {
+    const dateStr = date ? date.toISOString().split("T")[0] : "";
+    const sortedParticipants = splitWith.slice().sort().join(",");
+    const cleanDesc = description.trim().toLowerCase();
+    const cleanPaidBy = paidBy.trim().toLowerCase();
+
+    const dataString = `${groupId}|${dateStr}|${amount}|${cleanPaidBy}|${sortedParticipants}|${cleanDesc}`;
+    return crypto.createHash("sha256").update(dataString).digest("hex");
+  }
+
   /**
    * Finalizes an ImportJob by processing all its rows through the DecisionEngine with user resolutions
    * and committing the results to the database.
@@ -181,6 +199,29 @@ export class PersistenceService {
             userMap
           );
 
+          // Compute deterministic rowSignature
+          const rowSignature = PersistenceService.computeRowSignature(
+            groupId,
+            finalizedRow.date,
+            finalizedRow.originalAmount,
+            finalizedRow.paidBy,
+            finalizedRow.splitWith,
+            finalizedRow.description
+          );
+
+          // Check if it already exists in the DB for this group
+          const existingExpense = await tx.expense.findFirst({
+            where: {
+              groupId,
+              rowSignature
+            }
+          });
+
+          if (existingExpense) {
+            console.log(`[PERSISTENCE:DEDUPLICATION] Skipping duplicate row signature ${rowSignature} for row ${rowNum} ('${finalizedRow.description}')`);
+            continue; // Skip insertion, do NOT affect balances, continue to next row!
+          }
+
           // Create Expense
           const expense = await tx.expense.create({
             data: {
@@ -194,7 +235,8 @@ export class PersistenceService {
               paidBy: payerId,
               expenseDate: finalizedRow.date,
               splitType: finalizedRow.splitType || "equal",
-              imported: true
+              imported: true,
+              rowSignature: rowSignature
             }
           });
 
