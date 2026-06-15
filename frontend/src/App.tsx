@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo } from "react";
+import IntroAnimation from "./IntroAnimation";
 import { api } from "./services/api";
 import { 
   Users, Plus, Upload, Trash2, ArrowRight, UserCheck, AlertTriangle, AlertOctagon, 
@@ -161,6 +162,7 @@ const SnapshotSkeleton = () => (
 );
 
 export default function App() {
+  const [showIntro, setShowIntro] = useState(true);
   const [token, setToken] = useState<string | null>(localStorage.getItem("token"));
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [view, setView] = useState<"login" | "register" | "dashboard" | "group-detail" | "import" | "admin-demo">("login");
@@ -341,7 +343,8 @@ export default function App() {
     setLoadingGroups(true);
     try {
       const res = await api.get("/groups");
-      setGroups(res.data);
+      const raw = res.data;
+      setGroups(Array.isArray(raw) ? raw : (raw?.groups ?? raw?.data ?? []));
       if (token) {
         fetchGlobalBalances();
       }
@@ -355,7 +358,8 @@ export default function App() {
   const fetchImportJobs = async () => {
     try {
       const res = await api.get("/imports/jobs");
-      setImportJobs(res.data);
+      const rawJobs = res.data;
+      setImportJobs(Array.isArray(rawJobs) ? rawJobs : (rawJobs?.jobs ?? rawJobs?.data ?? []));
     } catch (err) {
       console.error(err);
     }
@@ -429,10 +433,12 @@ export default function App() {
       setSelectedGroup(gRes.data);
       
       const eRes = await api.get(`/expenses/group/${groupId}`);
-      setExpenses(eRes.data);
+      const eRaw = eRes.data;
+      setExpenses(Array.isArray(eRaw) ? eRaw : (eRaw?.expenses ?? eRaw?.data ?? []));
 
       const sRes = await api.get(`/settlements/group/${groupId}`);
-      setSettlements(sRes.data);
+      const sRaw = sRes.data;
+      setSettlements(Array.isArray(sRaw) ? sRaw : (sRaw?.settlements ?? sRaw?.data ?? []));
 
       const bRes = await api.get(`/balances/group/${groupId}`);
       setBalances(bRes.data);
@@ -565,6 +571,7 @@ export default function App() {
     setImportError("");
     setDuplicateBatchError(null);
     setImportStats(null);
+    setActiveImportJobId(null);
     setDiagnosticsLogs([]); 
     setImportStartTime(Date.now());
     setView("import");
@@ -728,7 +735,7 @@ export default function App() {
   const dynamicTimeline = useMemo(() => {
     const events: { id: string; date: string; title: string; category: string; user: string; amount?: number }[] = [];
     
-    groups.forEach(g => {
+    (Array.isArray(groups) ? groups : []).forEach(g => {
       const groupExpenses = (g as any).expenses || [];
       groupExpenses.forEach((e: any) => {
         events.push({
@@ -754,7 +761,7 @@ export default function App() {
       });
     });
 
-    importJobs.forEach(j => {
+    (Array.isArray(importJobs) ? importJobs : []).forEach(j => {
       events.push({
         id: `job-${j.id}`,
         date: j.uploadedAt,
@@ -766,7 +773,7 @@ export default function App() {
     });
 
     if (selectedGroupId && selectedGroup) {
-      expenses.forEach(e => {
+      (Array.isArray(expenses) ? expenses : []).forEach(e => {
         if (!events.some(evt => evt.id === `exp-${e.id}`)) {
           events.push({
             id: `exp-${e.id}`,
@@ -778,7 +785,7 @@ export default function App() {
           });
         }
       });
-      settlements.forEach(s => {
+      (Array.isArray(settlements) ? settlements : []).forEach(s => {
         if (!events.some(evt => evt.id === `settle-${s.id}`)) {
           events.push({
             id: `settle-${s.id}`,
@@ -894,6 +901,12 @@ export default function App() {
   }, [expenses, expenseSearch, expenseSortField, expenseSortOrder]);
 
   return (
+    <>
+      {showIntro && (
+        <IntroAnimation
+          onComplete={() => setShowIntro(false)}
+        />
+      )}
     <div className="min-h-screen bg-[#F8FAFC] text-[#0F172A] flex flex-col font-sans antialiased selection:bg-blue-600 selection:text-white">
       {/* Toast Notifications */}
       {toasts.length > 0 && (
@@ -929,9 +942,9 @@ export default function App() {
           setImportResolutions({});
           setImportStats(null);
         }}>
-          <div className="w-8 h-8 rounded-lg bg-blue-50 border border-blue-100 flex items-center justify-center text-blue-600 shrink-0">
-            <CreditCard className="w-4 h-4" strokeWidth={1.5} />
-          </div>
+          <div className="w-8 h-8 flex items-center justify-center shrink-0 select-none">
+             <span style={{ fontFamily: "'Inter', sans-serif", fontSize: "1.25rem", fontWeight: 800, color: "#059669", lineHeight: 1, letterSpacing: "-0.02em" }}>₹</span>
+           </div>
           <div>
             <h1 className="font-bold text-base tracking-tight text-slate-950">Ledgerly</h1>
           </div>
@@ -1014,6 +1027,7 @@ export default function App() {
                   type="email" 
                   value={authEmail} 
                   onChange={e => setAuthEmail(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleAuth('login')}
                   className="w-full bg-white border border-slate-200 rounded-lg px-3.5 py-2 text-xs font-medium focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600" 
                   placeholder="name@example.com"
                 />
@@ -1024,6 +1038,7 @@ export default function App() {
                   type="password" 
                   value={authPassword} 
                   onChange={e => setAuthPassword(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleAuth('login')}
                   className="w-full bg-white border border-slate-200 rounded-lg px-3.5 py-2 text-xs font-medium focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
                   placeholder="••••••••"
                 />
@@ -1057,6 +1072,7 @@ export default function App() {
                   type="text" 
                   value={authName} 
                   onChange={e => setAuthName(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleAuth('register')}
                   className="w-full bg-white border border-slate-200 rounded-lg px-3.5 py-2 text-xs font-medium focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600" 
                   placeholder="Aisha"
                 />
@@ -1067,6 +1083,7 @@ export default function App() {
                   type="email" 
                   value={authEmail} 
                   onChange={e => setAuthEmail(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleAuth('register')}
                   className="w-full bg-white border border-slate-200 rounded-lg px-3.5 py-2 text-xs font-medium focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600" 
                   placeholder="aisha@example.com"
                 />
@@ -1077,6 +1094,7 @@ export default function App() {
                   type="password" 
                   value={authPassword} 
                   onChange={e => setAuthPassword(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleAuth('register')}
                   className="w-full bg-white border border-slate-200 rounded-lg px-3.5 py-2 text-xs font-medium focus:outline-none focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
                   placeholder="••••••••"
                 />
@@ -1640,6 +1658,7 @@ export default function App() {
                         type="text" 
                         value={expTitle}
                         onChange={e => setExpTitle(e.target.value)}
+                        onKeyDown={e => e.key === 'Enter' && handleAddExpense()}
                         placeholder="February rent..."
                         className="w-full bg-white border border-slate-350 rounded-lg px-3 py-2"
                       />
@@ -1651,6 +1670,7 @@ export default function App() {
                           type="number" 
                           value={expAmount}
                           onChange={e => setExpAmount(e.target.value)}
+                          onKeyDown={e => e.key === 'Enter' && handleAddExpense()}
                           placeholder="Amount..."
                           className="w-full bg-white border border-slate-350 rounded-lg px-3 py-2"
                         />
@@ -1793,6 +1813,7 @@ export default function App() {
                           type="number" 
                           value={settleAmount}
                           onChange={e => setSettleAmount(e.target.value)}
+                          onKeyDown={e => e.key === 'Enter' && handleAddSettlement()}
                           placeholder="Amount..."
                           className="w-full bg-white border border-slate-355 rounded-lg px-3 py-2"
                         />
@@ -1873,6 +1894,7 @@ export default function App() {
                         type="email" 
                         value={addMemberEmail}
                         onChange={e => setAddMemberEmail(e.target.value)}
+                        onKeyDown={e => e.key === 'Enter' && handleAddMember()}
                         placeholder="aisha@example.com"
                         className="w-full bg-white border border-slate-350 rounded-lg px-3 py-2"
                       />
@@ -2000,7 +2022,7 @@ export default function App() {
                     {/* Transaction count reduction banner */}
                     {showOptimized && balances && balances.simplifiedDebts.length < rawDebts.length && (
                       <div className="mb-4 p-3 bg-blue-50 border border-blue-100 rounded-lg flex items-center space-x-2 text-[10px] font-medium text-blue-800">
-                        <Sparkles className="w-3.5 h-3.5 text-blue-600 flex-shrink-0" strokeWidth={1.5} />
+                        <CheckCircle className="w-3.5 h-3.5 text-blue-600 flex-shrink-0" strokeWidth={1.5} />
                         <div>
                           Debt optimized: <b>{rawDebts.length}</b> transactions reduced to <b>{balances.simplifiedDebts.length}</b>!
                         </div>
@@ -2145,7 +2167,7 @@ export default function App() {
         )}
 
         {/* VIEW: CSV IMPORT QUEUE (REVIEW WORKFLOW REDESIGN) */}
-        {view === "import" && selectedGroup && activeImportJobId && (
+        {view === "import" && selectedGroup && (
           <div className="space-y-6 animate-fade-in">
             
             <div className="flex items-center justify-between border-b border-slate-200 pb-4">
@@ -2233,23 +2255,23 @@ export default function App() {
                         showToast("Failed to fetch previous import job details.", "error");
                       }
                     }}
-                    className="w-full bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold py-2 rounded-lg transition-all shadow-sm cursor-pointer"
+                    className="w-full bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold py-2 rounded-lg transition-all shadow-sm cursor-pointer flex items-center justify-center gap-1.5"
                   >
-                    👀 View previous import
+                    <Eye className="w-3.5 h-3.5" strokeWidth={1.5} /> View previous import
                   </button>
 
                   <button
                     onClick={() => handleUploadCsv("DEMO")}
-                    className="w-full bg-amber-500 hover:bg-amber-600 text-white text-xs font-semibold py-2 rounded-lg transition-all shadow-sm cursor-pointer"
+                    className="w-full bg-amber-500 hover:bg-amber-600 text-white text-xs font-semibold py-2 rounded-lg transition-all shadow-sm cursor-pointer flex items-center justify-center gap-1.5"
                   >
-                    🔁 Re-run import (Demo Mode)
+                    <RefreshCw className="w-3.5 h-3.5" strokeWidth={1.5} /> Re-run import (Demo Mode)
                   </button>
 
                   <button
                     onClick={() => handleUploadCsv("FORCE")}
-                    className="w-full bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold py-2 rounded-lg transition-all shadow-sm cursor-pointer"
+                    className="w-full bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold py-2 rounded-lg transition-all shadow-sm cursor-pointer flex items-center justify-center gap-1.5"
                   >
-                    ➕ Force new import (Admin Mode)
+                    <Plus className="w-3.5 h-3.5" strokeWidth={1.5} /> Force new import (Admin Mode)
                   </button>
 
                   <button
@@ -3357,5 +3379,6 @@ export default function App() {
         </div>
       )}
     </div>
+    </>
   );
 }
